@@ -27,7 +27,7 @@ The watcher will monitor the configured folder for new PDF files prefixed with `
 
 ## Building a Windows Executable (GitHub Action)
 
-A GitHub Actions workflow (`.github/workflows/build_release.yml`) is provided to build a single‑file Windows executable (`watcher.exe`) using **PyInstaller** and publish it as a release asset.
+A GitHub Actions workflow (`.github/workflows/build_release.yml`) is provided to build a single‑file Windows executable (`cmr-renamer.exe`) using **PyInstaller** and publish it as a release asset.
 
 ## License
 
