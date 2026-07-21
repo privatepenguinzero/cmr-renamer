@@ -50,7 +50,7 @@ jobs:
       # 7️⃣ Build the Windows executable with PyInstaller
       - name: Build executable
         run: |
-          uv run -- pyinstaller --onefile --windowed --name cmr-renamer watcher.py
+          uv run -- pyinstaller --onefile --name cmr-renamer watcher.py
         shell: pwsh
 
       # 8️⃣ Verify the executable was created
