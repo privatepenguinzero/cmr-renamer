@@ -8,52 +8,74 @@ jobs:
   build:
     runs-on: windows-latest
     permissions:
-      contents: write  # needed for uploading release assets
+      contents: write   # needed for uploading release assets
 
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # fetch all tags
+      # 1️⃣ Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # fetch all tags
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      # 2️⃣ Set up Python 3.10
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-    - name: Install uv
-      run: |
-        pip install uv
+      # 3️⃣ Install uv (dependency manager)
+      - name: Install uv
+        run: |
+          pip install --upgrade uv
+        shell: pwsh
 
-    - name: Sync dependencies
-      run: |
-        uv sync
+      # 4️⃣ Add PyInstaller as a dev dependency (must be before sync)
+      - name: Add PyInstaller as dev dependency
+        run: |
+          uv add --dev pyinstaller
+        shell: pwsh
 
-    - name: Install PyInstaller (for building)
-      run: |
-        uv add --dev pyinstaller
+      # 5️⃣ Sync all project dependencies (now includes PyInstaller)
+      - name: Sync project dependencies
+        run: |
+          uv sync
+        shell: pwsh
 
-    - name: Build executable with PyInstaller
-      run: |
-        uv run pyinstaller --onefile --windowed --name cmr-renamer watcher.py
+      # 6️⃣ Install Tesseract OCR (required for pytesseract)
+      - name: Install Tesseract OCR
+        run: |
+          choco install -y tesseract
+        shell: cmd
 
-    - name: Verify executable exists
-      run: |
-        if not exist dist\cmr-renamer.exe (
-          echo Executable not found!
-          exit 1
-        ) else (
-          echo Executable built successfully.
-        )
+      # 7️⃣ Build the Windows executable with PyInstaller
+      - name: Build executable
+        run: |
+          uv run -- pyinstaller --onefile --windowed --name cmr-renamer watcher.py
+        shell: pwsh
 
-    - name: Upload executable as artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: cmr-renamer-windows-exe
-        path: dist\cmr-renamer.exe
+      # 8️⃣ Verify the executable was created
+      - name: Verify executable exists
+        id: verify
+        run: |
+          if (-not (Test-Path "dist\\cmr-renamer.exe")) {
+            Write-Error "Executable not found!"
+            exit 1
+          } else {
+            Write-Host "Executable built successfully."
+          }
+        shell: pwsh
 
-    - name: Upload release asset
-      uses: softprops/action-gh-release@v2
-      with:
-        files: dist\cmr-renamer.exe
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 9️⃣ Upload the artifact (optional, for debugging)
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmr-renamer-windows-exe
+          path: dist\\cmr-renamer.exe
+
+      # 🔟 Attach the executable to the GitHub release
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist\\cmr-renamer.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
