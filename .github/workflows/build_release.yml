@@ -50,14 +50,13 @@ jobs:
       # 7️⃣ Build the Windows executable with PyInstaller
       - name: Build executable
         run: |
-          uv run -- pyinstaller --onefile --name cmr-renamer watcher.py
+          uv run -- pyinstaller --onefile --name cmr-renamer cmr_renamer/cli.py
         shell: pwsh
 
       # 8️⃣ Verify the executable was created
       - name: Verify executable exists
-        id: verify
         run: |
-          if (-not (Test-Path "dist\\cmr-renamer.exe")) {
+          if (!(Test-Path "dist\\cmr-renamer.exe")) {
             Write-Error "Executable not found!"
             exit 1
           } else {
