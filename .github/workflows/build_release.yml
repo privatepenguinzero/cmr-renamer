@@ -7,9 +7,13 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write  # needed for uploading release assets
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # fetch all tags
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -30,11 +34,16 @@ jobs:
 
     - name: Build executable with PyInstaller
       run: |
-        uv run pyinstaller --onefile --windowed watcher.py
+        uv run pyinstaller --onefile --windowed --name cmr-renamer watcher.py
 
-    - name: Rename executable
+    - name: Verify executable exists
       run: |
-        ren dist\watcher.exe cmr-renamer.exe
+        if not exist dist\cmr-renamer.exe (
+          echo "Executable not found!"
+          exit 1
+        ) else (
+          echo "Executable built successfully."
+        )
 
     - name: Upload executable as artifact
       uses: actions/upload-artifact@v4
@@ -42,11 +51,9 @@ jobs:
         name: cmr-renamer-windows-exe
         path: dist\cmr-renamer.exe
 
-    - name: Create Release (if not already created) and upload asset
-      if: github.event_name == 'release' && github.event.action == 'published'
+    - name: Upload release asset
       uses: softprops/action-gh-release@v2
       with:
         files: dist\cmr-renamer.exe
-        # The release is already created by the trigger, we just upload the asset
-        # If we need to create a release, we can use the release created by the trigger.
-        # The action will upload to the release that triggered the workflow.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
