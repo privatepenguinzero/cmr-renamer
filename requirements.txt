@@ -1,4 +1,0 @@
-watchdog
-pillow
-pytesseract
-pdf2image
