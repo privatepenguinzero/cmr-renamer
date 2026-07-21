@@ -39,10 +39,10 @@ jobs:
     - name: Verify executable exists
       run: |
         if not exist dist\cmr-renamer.exe (
-          echo "Executable not found!"
+          echo Executable not found!
           exit 1
         ) else (
-          echo "Executable built successfully."
+          echo Executable built successfully.
         )
 
     - name: Upload executable as artifact
