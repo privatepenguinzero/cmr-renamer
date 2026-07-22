@@ -2,7 +2,7 @@
 
 Watches a directory for new PDF files and triggers OCR-based renaming.
 When frozen (PyInstaller --windowed) the executable has no console by default;
-if config.ini is missing a console is allocated temporarily for setup,
+if config.ini is missing a console is allocated temporarily for interactive setup,
 then freed. In background mode, output is logged to a file.
 """
 
@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import ctypes  # For Windows console manipulation
+import atexit
 
 import pytesseract
 from pdf2image import convert_from_path
@@ -18,36 +19,48 @@ from PIL import Image, ImageDraw
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from .config import load_or_create_config, CONFIG_FILE
+from .config import load_or_create_config
 
 
 # ──────────────────────────────────────────────────────────────
 # Console management (Windows only)
 # ──────────────────────────────────────────────────────────────
 
+_console_allocated = False
+
 def _alloc_console():
     """Allocate a Windows console for interactive setup."""
+    global _console_allocated
+    if not _is_frozen() or _console_allocated:
+        return # Only allocate if frozen and not already allocated
+
     kernel32 = ctypes.windll.kernel32
     if kernel32.AllocConsole():
         # Redirect stdout, stderr, and stdin to the new console
-        sys.stdout.reconfigure(encoding='utf-8')
-        sys.stderr.reconfigure(encoding='utf-8')
-        sys.stdin.reconfigure(encoding='utf-8')
+        # Use UTF-8 encoding for broader compatibility
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+
         # Set console title (optional)
         ctypes.windll.kernel32.SetConsoleTitleW("CMR Renamer Setup")
+        _console_allocated = True
 
 
 def _free_console():
     """Free the allocated Windows console."""
-    import ctypes
-    ctypes.windll.kernel32.FreeConsole()
+    global _console_allocated
+    if _console_allocated:
+        import ctypes
+        ctypes.windll.kernel32.FreeConsole()
+        _console_allocated = False
 
 
 def _setup_file_logging(log_dir: str):
     """Redirect stdout/stderr to a log file in background mode."""
     log_path = os.path.join(log_dir, 'cmr-renamer.log')
-    # Use 'a' for append mode, ensure UTF-8 encoding
-    sys.stdout = open(log_path, 'a', encoding='utf-8')
+    # Use 'a' for append mode, ensure UTF-8 encoding, replace errors
+    sys.stdout = open(log_path, 'a', encoding='utf-8', errors='replace')
     sys.stderr = sys.stdout  # Redirect stderr to the same log file
 
 
@@ -164,6 +177,10 @@ class CMRHandler(FileSystemEventHandler):
         _rinomina_pdf(path, self.ocr_cfg, self.name_cfg)
 
 
+# ──────────────────────────────────────────────────────────────
+# Public entry point
+# ──────────────────────────────────────────────────────────────
+
 def run() -> int:
     """Main entry point: load config, process existing files, start watcher.
 
@@ -179,32 +196,40 @@ def run() -> int:
         _alloc_console()
         print("\n=== CMR Renamer - Configurazione Iniziale ===\n")
         try:
-            cfg = load_or_create_config()
+            cfg = load_or_create_config(config_path=config_path)
+        except Exception as e:
+            print(f"❌ Errore durante la configurazione: {e}")
+            # Ensure console is freed even if setup fails
+            _free_console()
+            return 1 # Indicate error
         finally:
-            _free_console() # Ensure console is freed even if setup fails
+            _free_console()  # Ensure console is freed
+
+        # After setup, continue in background mode
+        _setup_file_logging(config_dir)
     elif _is_frozen() and config_exists:
         # Frozen + config exists → background mode (no console)
         _setup_file_logging(config_dir)
-        cfg = load_or_create_config()
+        cfg = load_or_create_config(config_path=config_path)
     else:
         # Normal Python execution → use console as-is
-        cfg = load_or_create_config()
+        cfg = load_or_create_config(config_path=config_path)
 
     # ── Parse config ───────────────────────────────────────
-    cartella = cfg['Watcher']['folder']
-    delay_riavvio = int(cfg['Watcher']['delay_riavvio'])
+    cartella = cfg.get('Watcher', 'folder')
+    delay_riavvio = int(cfg.get('Watcher', 'delay_riavvio'))
 
     ocr_cfg = {
-        'box1': tuple(map(int, cfg['OCR']['box1'].split(','))),
-        'box2': tuple(map(int, cfg['OCR']['box2'].split(','))),
-        'show_rects': cfg['OCR'].getboolean('show_rects'),
-        'lang': cfg['OCR']['lang'],
-        'dpi': int(cfg['OCR']['dpi']),
+        'box1': tuple(map(int, cfg.get('OCR', 'box1').split(','))),
+        'box2': tuple(map(int, cfg.get('OCR', 'box2').split(','))),
+        'show_rects': cfg.getboolean('OCR', 'show_rects'),
+        'lang': cfg.get('OCR', 'lang'),
+        'dpi': int(cfg.get('OCR', 'dpi')),
     }
 
     name_cfg = {
-        'max_length': int(cfg['Filename']['max_length']),
-        'remove_leading_zeros': cfg['Filename'].getboolean('remove_leading_zeros'),
+        'max_length': int(cfg.get('Filename', 'max_length')),
+        'remove_leading_zeros': cfg.getboolean('Filename', 'remove_leading_zeros'),
     }
 
     # ----------------------------------------------------------

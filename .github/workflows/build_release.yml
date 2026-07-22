@@ -44,17 +44,17 @@ jobs:
         shell: cmd
 
       # 7️⃣ Build executable
-      #     --windowed = no console by default (background mode)
-      #     if config.ini is missing, the app allocates a console for setup
+      #     Uses main.py as entry point for PyInstaller
       - name: Build executable
         run: |
-          uv run -- pyinstaller --onefile --windowed --name cmr-renamer main.py
+          uv run -- pyinstaller --onefile --name cmr-renamer main.py
         shell: pwsh
 
       # 8️⃣ Verify executable exists
       - name: Verify executable
+        id: verify
         run: |
-          if (!(Test-Path "dist\cmr-renamer.exe")) {
+          if (-not (Test-Path "dist\\cmr-renamer.exe")) {
             Write-Error "Executable not found!"
             exit 1
           } else {
@@ -67,12 +67,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cmr-renamer-windows-exe
-          path: dist\cmr-renamer.exe
+          path: dist\\cmr-renamer.exe
 
       # 🔟 Attach to release
-      - name: Upload release asset
+      - name: Publish release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist\cmr-renamer.exe
+          files: dist\\cmr-renamer.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

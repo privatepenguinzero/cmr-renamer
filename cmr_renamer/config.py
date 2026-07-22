@@ -40,7 +40,7 @@ def _prompt_for_folder():
     return _prompt_console("Inserisci il percorso completo della cartella da monitorare")
 
 
-def load_or_create_config(config_path: str = None) -> configparser.ConfigParser:
+def load_or_create_config(config_path: str = None) -> "configparser.ConfigParser":
     """Load config.ini — create it interactively if missing.
 
     Args:
@@ -54,7 +54,17 @@ def load_or_create_config(config_path: str = None) -> configparser.ConfigParser:
         if getattr(sys, 'frozen', False):
             config_dir = os.path.dirname(os.path.abspath(sys.executable))
         else:
-            config_dir = os.getcwd()
+            # When running from source, look for config.ini in the same directory
+            # as the script being run (not necessarily this config.py file)
+            if getattr(sys, 'argv', None) and len(sys.argv) > 0:
+                script_path = os.path.abspath(sys.argv[0])
+                if os.path.exists(script_path):
+                    config_dir = os.path.dirname(script_path)
+                else:
+                    config_dir = os.getcwd()
+            else:
+                # Fallback to current working directory
+                config_dir = os.getcwd()
         config_path = os.path.join(config_dir, 'config.ini')
 
     config = configparser.ConfigParser()
