@@ -1,6 +1,6 @@
 [project]
 name = "cmr-renamer"
-version = "1.0.0"
+version = "1.0.13"
 description = "A file watcher and renamer for CMR documents using OCR"
 readme = "README.md"
 requires-python = ">=3.10"
