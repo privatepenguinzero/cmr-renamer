@@ -55,18 +55,17 @@ def _alloc_console():
 
     kernel32 = ctypes.windll.kernel32
     if kernel32.AllocConsole():
-        # Redirect stdout, stderr, and stdin to the new console
-        # Use UTF-8 encoding for broader compatibility
-        # Handle case where streams might be None in frozen environment
-        if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
-            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-        if sys.stderr is not None and hasattr(sys.stderr, 'reconfigure'):
-            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        if sys.stdin is not None and hasattr(sys.stdin, 'reconfigure'):
-            sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+        # In --windowed builds sys.stdout/stderr/stdin are None (no console
+        # was attached at process start), so there is nothing to reconfigure.
+        # The newly allocated console's device files must be opened and
+        # assigned directly, or print()/input() will crash with
+        # AttributeError as soon as they're used.
+        sys.stdout = open('CONOUT$', 'w', encoding='utf-8', errors='replace')
+        sys.stderr = open('CONOUT$', 'w', encoding='utf-8', errors='replace')
+        sys.stdin = open('CONIN$', 'r', encoding='utf-8', errors='replace')
 
         # Set console title (optional)
-        ctypes.windll.kernel32.SetConsoleTitleW("CMR Renamer Setup")
+        kernel32.SetConsoleTitleW("CMR Renamer Setup")
         _console_allocated = True
 
 
@@ -74,7 +73,11 @@ def _free_console():
     """Free the allocated Windows console."""
     global _console_allocated
     if _console_allocated:
-        import ctypes
+        for stream in (sys.stdout, sys.stderr, sys.stdin):
+            try:
+                stream.close()
+            except Exception:
+                pass
         ctypes.windll.kernel32.FreeConsole()
         _console_allocated = False
 
