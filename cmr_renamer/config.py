@@ -40,30 +40,28 @@ def _prompt_for_folder():
     return _prompt_console("Inserisci il percorso completo della cartella da monitorare")
 
 
-def get_config_dir():
-    """Determine where config.ini should live.
-
-    - Frozen (PyInstaller): next to the .exe
-    - Normal Python: current working directory
-    """
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.getcwd()
-
-
-def load_or_create_config():
+def load_or_create_config(config_path: str = None) -> configparser.ConfigParser:
     """Load config.ini — create it interactively if missing.
+
+    Args:
+        config_path: Optional path to config.ini. If not provided, the default
+                     location is used (same directory as the executable if frozen,
+                     otherwise the current working directory).
 
     Returns a configparser.ConfigParser instance ready to use.
     """
-    config_dir = get_config_dir()
-    config_file = os.path.join(config_dir, 'config.ini')
+    if config_path is None:
+        if getattr(sys, 'frozen', False):
+            config_dir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            config_dir = os.getcwd()
+        config_path = os.path.join(config_dir, 'config.ini')
 
     config = configparser.ConfigParser()
 
-    if not os.path.exists(config_file):
+    if not os.path.exists(config_path):
         print("\n=== FILE DI CONFIGURAZIONE NON TROVATO ===")
-        print(f"Percorso atteso: {config_file}")
+        print(f"Percorso atteso: {config_path}")
         print("Creazione guidata — Invio per usare il valore predefinito tra [parentesi].\n")
 
         config['Watcher'] = {}
@@ -77,7 +75,7 @@ def load_or_create_config():
             "Coordinate box1 — numero documento (x1,y1,x2,y2)", "595,1615,760,1750"
         )
         config['OCR']['box2'] = _prompt_console(
-            "Coordinate box2 — ragione sociale (x1,y1,x2,y2)", "230,720,1085,785"
+            "Coordinate box2 — ragione sociale (x1,y1,x2,y2)", "230,725,1085,805"
         )
         show_rects = _prompt_console(
             "Mostrare rettangoli di debug? (True/False)", "False"
@@ -95,11 +93,11 @@ def load_or_create_config():
         ).lower()
         config['Filename']['remove_leading_zeros'] = str(remove_zeros in ['true', '1', 'yes', 'y'])
 
-        with open(config_file, 'w') as f:
+        with open(config_path, 'w') as f:
             config.write(f)
-        print(f"\n✅ Configurazione salvata in: {config_file}\n")
+        print(f"\n✅ Configurazione salvata in: {config_path}\n")
     else:
-        config.read(config_file)
-        print(f"📂 Configurazione caricata da: {config_file}")
+        config.read(config_path)
+        print(f"📂 Configurazione caricata da: {config_path}")
 
     return config

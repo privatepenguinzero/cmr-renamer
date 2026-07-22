@@ -2,7 +2,7 @@
 
 Watches a directory for new PDF files and triggers OCR-based renaming.
 When frozen (PyInstaller --windowed) the executable has no console by default;
-if config.ini is missing a console is allocated temporarily for interactive setup,
+if config.ini is missing a console is allocated temporarily for setup,
 then freed. In background mode, output is logged to a file.
 """
 
@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import time
+import ctypes  # For Windows console manipulation
 
 import pytesseract
 from pdf2image import convert_from_path
@@ -17,21 +18,23 @@ from PIL import Image, ImageDraw
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from .config import load_or_create_config
+from .config import load_or_create_config, CONFIG_FILE
 
 
 # ──────────────────────────────────────────────────────────────
-# Console management (Windows only, PyInstaller --windowed mode)
+# Console management (Windows only)
 # ──────────────────────────────────────────────────────────────
 
 def _alloc_console():
     """Allocate a Windows console for interactive setup."""
-    import ctypes
     kernel32 = ctypes.windll.kernel32
-    kernel32.AllocConsole()
-    sys.stdout = open('CONOUT$', 'w', encoding='utf-8')
-    sys.stderr = open('CONOUT$', 'w', encoding='utf-8')
-    sys.stdin = open('CONIN$', 'r', encoding='utf-8')
+    if kernel32.AllocConsole():
+        # Redirect stdout, stderr, and stdin to the new console
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+        sys.stdin.reconfigure(encoding='utf-8')
+        # Set console title (optional)
+        ctypes.windll.kernel32.SetConsoleTitleW("CMR Renamer Setup")
 
 
 def _free_console():
@@ -43,21 +46,9 @@ def _free_console():
 def _setup_file_logging(log_dir: str):
     """Redirect stdout/stderr to a log file in background mode."""
     log_path = os.path.join(log_dir, 'cmr-renamer.log')
-    log_file = open(log_path, 'a', encoding='utf-8')
-    sys.stdout = log_file
-    sys.stderr = log_file
-
-
-def _get_config_dir() -> str:
-    """Return the directory where config.ini lives."""
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _is_frozen() -> bool:
-    """Check if running as a PyInstaller executable."""
-    return getattr(sys, 'frozen', False)
+    # Use 'a' for append mode, ensure UTF-8 encoding
+    sys.stdout = open(log_path, 'a', encoding='utf-8')
+    sys.stderr = sys.stdout  # Redirect stderr to the same log file
 
 
 # ──────────────────────────────────────────────────────────────
@@ -107,10 +98,7 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
             img.crop(ocr_cfg['box2']), lang=ocr_cfg['lang']
         )
 
-        base = (
-            f"{_pulisci_nome(testo1, name_cfg['max_length'], name_cfg['remove_leading_zeros'])} "
-            f"{_pulisci_nome(testo2, name_cfg['max_length'], name_cfg['remove_leading_zeros'])}"
-        ).strip()
+        base = f"{_pulisci_nome(testo1, name_cfg['max_length'], name_cfg['remove_leading_zeros'])} {_pulisci_nome(testo2, name_cfg['max_length'], name_cfg['remove_leading_zeros'])}".strip()
         if not base:
             base = "documento_senza_nome"
 
@@ -176,10 +164,6 @@ class CMRHandler(FileSystemEventHandler):
         _rinomina_pdf(path, self.ocr_cfg, self.name_cfg)
 
 
-# ──────────────────────────────────────────────────────────────
-# Public entry point
-# ──────────────────────────────────────────────────────────────
-
 def run() -> int:
     """Main entry point: load config, process existing files, start watcher.
 
@@ -194,8 +178,10 @@ def run() -> int:
         # Frozen + no config → allocate console for setup
         _alloc_console()
         print("\n=== CMR Renamer - Configurazione Iniziale ===\n")
-        cfg = load_or_create_config()
-        _free_console()
+        try:
+            cfg = load_or_create_config()
+        finally:
+            _free_console() # Ensure console is freed even if setup fails
     elif _is_frozen() and config_exists:
         # Frozen + config exists → background mode (no console)
         _setup_file_logging(config_dir)
@@ -221,23 +207,34 @@ def run() -> int:
         'remove_leading_zeros': cfg['Filename'].getboolean('remove_leading_zeros'),
     }
 
-    # ── Process existing files ─────────────────────────────
-    print(f"🔍 Elaborazione file esistenti in: {cartella}")
+    # ----------------------------------------------------------
+    # Process existing files on startup
+    # ----------------------------------------------------------
+    print(f"\n🔍 Elaborazione file esistenti in: {cartella}")
     if os.path.isdir(cartella):
         for fname in os.listdir(cartella):
             if fname.startswith('DOC') and fname.endswith('.pdf'):
                 _rinomina_pdf(os.path.join(cartella, fname), ocr_cfg, name_cfg)
     else:
-        print(f"⚠️ La cartella '{cartella}' non esiste.")
+        print(f"⚠️ La cartella '{cartella}' non esiste. Il watcher attenderà che venga creata.")
 
-    # ── Start watcher ──────────────────────────────────────
-    print(f"👀 Monitoraggio avviato su: {cartella}")
+    # ----------------------------------------------------------
+    # Start watcher
+    # ----------------------------------------------------------
+    print(f"\n👀 Monitoraggio avviato su: {cartella}")
     print("   Premi Ctrl+C per fermare.\n")
 
     handler = CMRHandler(ocr_cfg, name_cfg, delay_riavvio)
     observer = Observer()
-    observer.schedule(handler, cartella, recursive=False)
-    observer.start()
+    try:
+        observer.schedule(handler, cartella, recursive=False)
+        observer.start()
+    except FileNotFoundError:
+        print(f"❌ Errore: La cartella monitorata '{cartella}' non è valida.")
+        return 1 # Indicate error
+    except Exception as e:
+        print(f"❌ Errore durante l'avvio del watcher: {e}")
+        return 1 # Indicate error
 
     try:
         while True:
