@@ -1,0 +1,31 @@
+# Dependabot configuration for keeping dependencies updated
+version: 2
+updates:
+  # Maintain dependencies for GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # Allow all dependency types, including transitive ones
+    allow:
+      - dependency-type: "all"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # Maintain Python project dependencies
+  - package-ecosystem: "pip"
+    directory: "/"
+    # Look for dependencies in pyproject.toml
+    # Dependabot uses pip to analyze pyproject.toml dependencies
+    # even if uv is used for resolution during workflow runs.
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # Allow all dependency types, including transitive ones
+    allow:
+      - dependency-type: "all"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
