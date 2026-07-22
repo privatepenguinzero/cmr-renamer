@@ -23,6 +23,25 @@ from .config import load_or_create_config
 
 
 # ──────────────────────────────────────────────────────────────
+# Helper functions for frozen/executable detection
+# ──────────────────────────────────────────────────────────────
+
+def _is_frozen() -> bool:
+    """Check if running as a PyInstaller executable."""
+    return getattr(sys, 'frozen', False)
+
+
+def _get_config_dir() -> str:
+    """Return the directory where config.ini lives."""
+    if _is_frozen():
+        # Frozen (PyInstaller): config lives next to the .exe
+        return os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        # Normal Python: config lives in current working directory
+        return os.getcwd()
+
+
+# ──────────────────────────────────────────────────────────────
 # Console management (Windows only)
 # ──────────────────────────────────────────────────────────────
 
@@ -216,20 +235,24 @@ def run() -> int:
         cfg = load_or_create_config(config_path=config_path)
 
     # ── Parse config ───────────────────────────────────────
-    cartella = cfg.get('Watcher', 'folder')
-    delay_riavvio = int(cfg.get('Watcher', 'delay_riavvio'))
+    try:
+        cartella = cfg['Watcher']['folder']
+        delay_riavvio = int(cfg['Watcher']['delay_riavvio'])
+    except KeyError as e:
+        print(f"❌ Errore di configurazione: mancante chiave {e}")
+        return 1
 
     ocr_cfg = {
-        'box1': tuple(map(int, cfg.get('OCR', 'box1').split(','))),
-        'box2': tuple(map(int, cfg.get('OCR', 'box2').split(','))),
-        'show_rects': cfg.getboolean('OCR', 'show_rects'),
-        'lang': cfg.get('OCR', 'lang'),
-        'dpi': int(cfg.get('OCR', 'dpi')),
+        'box1': tuple(map(int, cfg['OCR']['box1'].split(','))),
+        'box2': tuple(map(int, cfg['OCR']['box2'].split(','))),
+        'show_rects': cfg['OCR'].getboolean('show_rects'),
+        'lang': cfg['OCR']['lang'],
+        'dpi': int(cfg['OCR']['dpi']),
     }
 
     name_cfg = {
-        'max_length': int(cfg.get('Filename', 'max_length')),
-        'remove_leading_zeros': cfg.getboolean('Filename', 'remove_leading_zeros'),
+        'max_length': int(cfg['Filename']['max_length']),
+        'remove_leading_zeros': cfg['Filename'].getboolean('remove_leading_zeros'),
     }
 
     # ----------------------------------------------------------
