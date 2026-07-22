@@ -57,9 +57,13 @@ def _alloc_console():
     if kernel32.AllocConsole():
         # Redirect stdout, stderr, and stdin to the new console
         # Use UTF-8 encoding for broader compatibility
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+        # Handle case where streams might be None in frozen environment
+        if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if sys.stderr is not None and hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        if sys.stdin is not None and hasattr(sys.stdin, 'reconfigure'):
+            sys.stdin.reconfigure(encoding='utf-8', errors='replace')
 
         # Set console title (optional)
         ctypes.windll.kernel32.SetConsoleTitleW("CMR Renamer Setup")
