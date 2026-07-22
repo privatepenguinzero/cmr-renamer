@@ -222,14 +222,13 @@ def run() -> int:
             cfg = load_or_create_config(config_path=config_path)
         except Exception as e:
             print(f"❌ Errore durante la configurazione: {e}")
-            # Ensure console is freed even if setup fails
             _free_console()
             return 1 # Indicate error
-        finally:
-            _free_console()  # Ensure console is freed
-
-        # After setup, continue in background mode
-        _setup_file_logging(config_dir)
+        else:
+            # No exception
+            _free_console()
+            # After setup, continue in background mode
+            _setup_file_logging(config_dir)
     elif _is_frozen() and config_exists:
         # Frozen + config exists → background mode (no console)
         _setup_file_logging(config_dir)
