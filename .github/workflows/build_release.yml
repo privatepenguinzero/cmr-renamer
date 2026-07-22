@@ -15,7 +15,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # fetch all tags
+          fetch-depth: 0
 
       # 2️⃣ Set up Python 3.10
       - name: Set up Python 3.10
@@ -23,58 +23,56 @@ jobs:
         with:
           python-version: "3.10"
 
-      # 3️⃣ Install uv (dependency manager)
+      # 3️⃣ Install uv
       - name: Install uv
-        run: |
-          pip install --upgrade uv
+        run: pip install --upgrade uv
         shell: pwsh
 
-      # 4️⃣ Add PyInstaller as a dev dependency (must be before sync)
-      - name: Add PyInstaller as dev dependency
-        run: |
-          uv add --dev pyinstaller
+      # 4️⃣ Add PyInstaller (must be before sync so it's in the lock file)
+      - name: Add PyInstaller
+        run: uv add --dev pyinstaller
         shell: pwsh
 
-      # 5️⃣ Sync all project dependencies (now includes PyInstaller)
-      - name: Sync project dependencies
-        run: |
-          uv sync
+      # 5️⃣ Sync all dependencies
+      - name: Sync dependencies
+        run: uv sync
         shell: pwsh
 
-      # 6️⃣ Install Tesseract OCR (required for pytesseract)
+      # 6️⃣ Install Tesseract OCR (required by pytesseract)
       - name: Install Tesseract OCR
-        run: |
-          choco install -y tesseract
+        run: choco install -y tesseract
         shell: cmd
 
-      # 7️⃣ Build the Windows executable with PyInstaller
+      # 7️⃣ Build executable
+      #     --windowed = no console by default (background mode)
+      #     if config.ini is missing, the app allocates a console for setup
       - name: Build executable
         run: |
-          uv run -- pyinstaller --onefile --name cmr-renamer cmr_renamer/cli.py
+          uv run -- pyinstaller --onefile --windowed --name cmr-renamer main.py
         shell: pwsh
 
-      # 8️⃣ Verify the executable was created
-      - name: Verify executable exists
+      # 8️⃣ Verify executable exists
+      - name: Verify executable
         run: |
-          if (!(Test-Path "dist\\cmr-renamer.exe")) {
+          if (!(Test-Path "dist\cmr-renamer.exe")) {
             Write-Error "Executable not found!"
             exit 1
           } else {
-            Write-Host "Executable built successfully."
+            Write-Host "✅ Executable built successfully."
           }
         shell: pwsh
 
-      # 9️⃣ Upload the artifact (optional, for debugging)
-      - name: Upload executable artifact
+      # 9️⃣ Upload artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: cmr-renamer-windows-exe
-          path: dist\\cmr-renamer.exe
+          path: dist\cmr-renamer.exe
 
-      # 🔟 Attach the executable to the GitHub release
-      - name: Publish release asset
+      # 🔟 Attach to release
+      - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist\\cmr-renamer.exe
+          files: dist\cmr-renamer.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

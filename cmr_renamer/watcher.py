@@ -1,10 +1,14 @@
 """File system watcher for CMR Renamer.
 
 Watches a directory for new PDF files and triggers OCR-based renaming.
+When frozen (PyInstaller --windowed) the executable has no console by default;
+if config.ini is missing a console is allocated temporarily for interactive setup,
+then freed. In background mode, output is logged to a file.
 """
 
 import os
 import re
+import sys
 import time
 
 import pytesseract
@@ -15,6 +19,50 @@ from watchdog.events import FileSystemEventHandler
 
 from .config import load_or_create_config
 
+
+# ──────────────────────────────────────────────────────────────
+# Console management (Windows only, PyInstaller --windowed mode)
+# ──────────────────────────────────────────────────────────────
+
+def _alloc_console():
+    """Allocate a Windows console for interactive setup."""
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.AllocConsole()
+    sys.stdout = open('CONOUT$', 'w', encoding='utf-8')
+    sys.stderr = open('CONOUT$', 'w', encoding='utf-8')
+    sys.stdin = open('CONIN$', 'r', encoding='utf-8')
+
+
+def _free_console():
+    """Free the allocated Windows console."""
+    import ctypes
+    ctypes.windll.kernel32.FreeConsole()
+
+
+def _setup_file_logging(log_dir: str):
+    """Redirect stdout/stderr to a log file in background mode."""
+    log_path = os.path.join(log_dir, 'cmr-renamer.log')
+    log_file = open(log_path, 'a', encoding='utf-8')
+    sys.stdout = log_file
+    sys.stderr = log_file
+
+
+def _get_config_dir() -> str:
+    """Return the directory where config.ini lives."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _is_frozen() -> bool:
+    """Check if running as a PyInstaller executable."""
+    return getattr(sys, 'frozen', False)
+
+
+# ──────────────────────────────────────────────────────────────
+# OCR & rename helpers
+# ──────────────────────────────────────────────────────────────
 
 def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     """Pulisce il testo OCR per usarlo come nome file."""
@@ -59,7 +107,10 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
             img.crop(ocr_cfg['box2']), lang=ocr_cfg['lang']
         )
 
-        base = f"{_pulisci_nome(testo1, name_cfg['max_length'], name_cfg['remove_leading_zeros'])} {_pulisci_nome(testo2, name_cfg['max_length'], name_cfg['remove_leading_zeros'])}".strip()
+        base = (
+            f"{_pulisci_nome(testo1, name_cfg['max_length'], name_cfg['remove_leading_zeros'])} "
+            f"{_pulisci_nome(testo2, name_cfg['max_length'], name_cfg['remove_leading_zeros'])}"
+        ).strip()
         if not base:
             base = "documento_senza_nome"
 
@@ -80,6 +131,10 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
     except Exception as e:
         print(f"❌ Errore per '{os.path.basename(pdf_path)}': {e}")
 
+
+# ──────────────────────────────────────────────────────────────
+# File system watcher
+# ──────────────────────────────────────────────────────────────
 
 class CMRHandler(FileSystemEventHandler):
     """Event handler che processa i PDF appena creati/spostati/modificati."""
@@ -121,10 +176,35 @@ class CMRHandler(FileSystemEventHandler):
         _rinomina_pdf(path, self.ocr_cfg, self.name_cfg)
 
 
-def run() -> None:
-    """Punto d'ingresso principale: carica config, processa i PDF esistenti, avvia il watcher."""
-    cfg = load_or_create_config()
+# ──────────────────────────────────────────────────────────────
+# Public entry point
+# ──────────────────────────────────────────────────────────────
 
+def run() -> int:
+    """Main entry point: load config, process existing files, start watcher.
+
+    Returns 0 on success.
+    """
+    config_dir = _get_config_dir()
+    config_path = os.path.join(config_dir, 'config.ini')
+    config_exists = os.path.exists(config_path)
+
+    # ── Background vs interactive mode ─────────────────────
+    if _is_frozen() and not config_exists:
+        # Frozen + no config → allocate console for setup
+        _alloc_console()
+        print("\n=== CMR Renamer - Configurazione Iniziale ===\n")
+        cfg = load_or_create_config()
+        _free_console()
+    elif _is_frozen() and config_exists:
+        # Frozen + config exists → background mode (no console)
+        _setup_file_logging(config_dir)
+        cfg = load_or_create_config()
+    else:
+        # Normal Python execution → use console as-is
+        cfg = load_or_create_config()
+
+    # ── Parse config ───────────────────────────────────────
     cartella = cfg['Watcher']['folder']
     delay_riavvio = int(cfg['Watcher']['delay_riavvio'])
 
@@ -141,17 +221,17 @@ def run() -> None:
         'remove_leading_zeros': cfg['Filename'].getboolean('remove_leading_zeros'),
     }
 
-    # Elabora PDF già presenti all'avvio
-    print(f"\n🔍 Elaborazione file esistenti in: {cartella}")
+    # ── Process existing files ─────────────────────────────
+    print(f"🔍 Elaborazione file esistenti in: {cartella}")
     if os.path.isdir(cartella):
         for fname in os.listdir(cartella):
             if fname.startswith('DOC') and fname.endswith('.pdf'):
                 _rinomina_pdf(os.path.join(cartella, fname), ocr_cfg, name_cfg)
     else:
-        print(f"⚠️ La cartella '{cartella}' non esiste. Il watcher attenderà che venga creata.")
+        print(f"⚠️ La cartella '{cartella}' non esiste.")
 
-    # Avvia il watcher
-    print(f"\n👀 Monitoraggio avviato su: {cartella}")
+    # ── Start watcher ──────────────────────────────────────
+    print(f"👀 Monitoraggio avviato su: {cartella}")
     print("   Premi Ctrl+C per fermare.\n")
 
     handler = CMRHandler(ocr_cfg, name_cfg, delay_riavvio)
@@ -168,3 +248,4 @@ def run() -> None:
 
     observer.join()
     print("👋 Monitoraggio terminato.")
+    return 0
