@@ -1,0 +1,26 @@
+# Dependabot configuration for keeping dependencies updated
+version: 2
+updates:
+  # Maintain dependencies for GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    allow:
+      - dependency-type: all
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # Maintain project dependencies (if any, e.g., Python dependencies)
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    allow:
+      - dependency-type: all
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
