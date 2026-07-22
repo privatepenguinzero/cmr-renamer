@@ -76,6 +76,9 @@ def load_or_create_config(config_path: str = None) -> "configparser.ConfigParser
 
         config['Watcher'] = {}
         config['Watcher']['folder'] = _prompt_for_folder()
+        config['Watcher']['prefix'] = _prompt_console(
+            "Prefisso del nome file da cercare (es. DOC)", "DOC"
+        )
         config['Watcher']['delay_riavvio'] = _prompt_console(
             "Delay tra rilevamenti ripetuti (secondi)", "3"
         )

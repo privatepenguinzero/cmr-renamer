@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-CMR Renamer watches a folder for new PDF files whose name starts with `DOC`, runs OCR on two fixed
-regions of the first page (document number + company name), and renames the file to the extracted
-text. It's a Windows-targeted background tool (built into a `.exe` via PyInstaller) but runs fine
-from source on any platform with Tesseract installed.
+CMR Renamer watches a folder for new PDF files whose name starts with a configurable prefix (`DOC` by
+default), runs OCR on two fixed regions of the first page (document number + company name), and
+renames the file to the extracted text. It's a Windows-targeted background tool (built into a `.exe`
+via PyInstaller) but runs fine from source on any platform with Tesseract installed.
 
 ## Commands
 
@@ -51,20 +51,27 @@ are all branched inside `run()`:
 **Config lives next to the executable (or CWD when running from source)**, in `config.ini`, and is
 created interactively on first run by `config.py` (`load_or_create_config`). It prefers a tkinter
 folder picker for the watched directory, falling back to console input if tkinter/GUI is unavailable.
-Config sections: `[Watcher]` (folder, delay_riavvio), `[OCR]` (box1/box2 crop coordinates, show_rects
-debug flag, lang, dpi), `[Filename]` (max_length, remove_leading_zeros). `watcher.run()` reads and
-type-converts every value out of the raw `ConfigParser` into plain dicts (`ocr_cfg`, `name_cfg`)
-before using them — if you add a config key, update both `config.py`'s prompts and this parsing step.
+Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1/box2 crop coordinates,
+show_rects debug flag, lang, dpi), `[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
+reads and type-converts every value out of the raw `ConfigParser` into plain dicts (`ocr_cfg`,
+`name_cfg`) before using them — if you add a config key, update both `config.py`'s prompts and this
+parsing step. `prefix` is read with `cfg['Watcher'].get('prefix', 'DOC')` rather than a plain
+subscript, since it was added after the original hardcoded `DOC` filter and older `config.ini` files
+won't have the key — keep that fallback pattern for any new key added to an existing section.
 
 **Processing pipeline** (`_rinomina_pdf`): `pdf2image.convert_from_path` renders page 1 → `PIL` crops
 the two configured boxes → `pytesseract.image_to_string` OCRs each crop → `_pulisci_nome` strips
 non-word characters, truncates to `max_length`, optionally strips leading zeros → the two cleaned
-strings are joined into the new filename, with `(1)`, `(2)`, ... appended on collision.
+strings are joined into the new filename, with `(1)`, `(2)`, ... appended on collision. If `show_rects`
+is `True`, `_calibra_box` opens a Tk window with the rendered page first, letting box1/box2 be redrawn
+by dragging with the mouse (a "Box 1"/"Box 2" toggle picks which one the next drag updates); saving
+persists the new coordinates to `config.ini` via `_save_boxes_to_config` and applies them immediately
+to `ocr_cfg` for the file being processed.
 
 **Watching**: `CMRHandler` (a `watchdog` `FileSystemEventHandler`) reacts to created/moved/modified
-events, filters to `*.pdf` files starting with `DOC`, waits for the file to stop growing
-(`_file_pronto`, since files typically arrive from a scanner/copier still being written), then calls
-`_rinomina_pdf`. A `processati` dict debounces repeat events per path using `delay_riavvio` from
+events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to stop
+growing (`_file_pronto`, since files typically arrive from a scanner/copier still being written), then
+calls `_rinomina_pdf`. A `processati` dict debounces repeat events per path using `delay_riavvio` from
 config. `run()` also sweeps the watched folder for pre-existing matching files once at startup, before
 starting the observer loop.
 

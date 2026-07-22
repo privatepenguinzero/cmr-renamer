@@ -148,15 +148,16 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         print("⚠️ tkinter non disponibile: calibrazione box saltata.")
         return None
 
-    order = ['box1', 'box2']
+    MIN_DRAG = 4  # px — ignore accidental clicks/near-zero drags
     labels = {
         'box1': "box 1 (numero documento)",
         'box2': "box 2 (ragione sociale)",
     }
     colors = {'box1': 'red', 'box2': 'blue'}
     boxes = {'box1': tuple(box1), 'box2': tuple(box2)}
-    state = {'step': 0, 'start': None, 'drag_id': None, 'result': None}
+    state = {'active': 'box1', 'start': None, 'drag_id': None, 'result': None}
     drawn_ids: dict = {}
+    select_buttons: dict = {}
 
     try:
         root = Tk()
@@ -168,6 +169,12 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         disp_w, disp_h = max(int(img.width * scale), 1), max(int(img.height * scale), 1)
 
         photo = ImageTk.PhotoImage(img.resize((disp_w, disp_h)))
+
+        select_frame = Frame(root)
+        select_frame.pack(pady=4)
+
+        label = Label(root, text="")
+        label.pack(pady=2)
 
         canvas = Canvas(root, width=disp_w, height=disp_h, cursor="cross")
         canvas.pack()
@@ -184,27 +191,46 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         draw_box('box1')
         draw_box('box2')
 
-        label = Label(
-            root,
-            text=f"Trascina col mouse per disegnare il {labels[order[0]]}.",
-        )
-        label.pack(pady=4)
+        def set_active(name):
+            state['active'] = name
+            for n, btn in select_buttons.items():
+                btn.config(relief=("sunken" if n == name else "raised"))
+            label.config(text=f"Box attivo: {labels[name]}. Trascina col mouse per ridisegnarlo.")
+
+        for name in ('box1', 'box2'):
+            select_buttons[name] = Button(
+                select_frame, text=labels[name], command=lambda n=name: set_active(n)
+            )
+            select_buttons[name].pack(side="left", padx=5)
+
+        set_active('box1')
 
         def on_press(event):
             state['start'] = (event.x, event.y)
 
         def on_drag(event):
+            if state['start'] is None:
+                return
             if state['drag_id'] is not None:
                 canvas.delete(state['drag_id'])
             x0, y0 = state['start']
-            name = order[min(state['step'], len(order) - 1)]
             state['drag_id'] = canvas.create_rectangle(
-                x0, y0, event.x, event.y, outline=colors[name], width=2, dash=(4, 2)
+                x0, y0, event.x, event.y, outline=colors[state['active']], width=2, dash=(4, 2)
             )
 
         def on_release(event):
+            if state['drag_id'] is not None:
+                canvas.delete(state['drag_id'])
+                state['drag_id'] = None
+            if state['start'] is None:
+                return
             x0, y0 = state['start']
+            state['start'] = None
             x1, y1 = event.x, event.y
+
+            if abs(x1 - x0) < MIN_DRAG or abs(y1 - y0) < MIN_DRAG:
+                return  # too small to be an intentional box — ignore
+
             x0 = min(max(x0, 0), disp_w)
             x1 = min(max(x1, 0), disp_w)
             y0 = min(max(y0, 0), disp_h)
@@ -212,19 +238,9 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
             x0, x1 = sorted((x0, x1))
             y0, y1 = sorted((y0, y1))
 
-            name = order[min(state['step'], len(order) - 1)]
+            name = state['active']
             boxes[name] = (int(x0 / scale), int(y0 / scale), int(x1 / scale), int(y1 / scale))
-            if state['drag_id'] is not None:
-                canvas.delete(state['drag_id'])
-                state['drag_id'] = None
             draw_box(name)
-
-            if state['step'] < len(order) - 1:
-                state['step'] += 1
-                next_name = order[state['step']]
-                label.config(text=f"Trascina col mouse per disegnare il {labels[next_name]}.")
-            else:
-                label.config(text="Box aggiornati. Premi Salva per confermare (o ridisegna il box 2).")
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
@@ -300,12 +316,13 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
 class CMRHandler(FileSystemEventHandler):
     """Event handler che processa i PDF appena creati/spostati/modificati."""
 
-    def __init__(self, ocr_cfg: dict, name_cfg: dict, delay: int):
+    def __init__(self, ocr_cfg: dict, name_cfg: dict, delay: int, prefix: str):
         super().__init__()
         self.processati: dict[str, float] = {}
         self.ocr_cfg = ocr_cfg
         self.name_cfg = name_cfg
         self.delay = delay
+        self.prefix = prefix
 
     def on_created(self, event):
         if not event.is_directory:
@@ -322,7 +339,7 @@ class CMRHandler(FileSystemEventHandler):
     def _processa(self, path: str) -> None:
         if not path or not path.endswith('.pdf'):
             return
-        if not os.path.basename(path).startswith('DOC'):
+        if not os.path.basename(path).startswith(self.prefix):
             return
 
         now = time.time()
@@ -381,6 +398,9 @@ def run() -> int:
     except KeyError as e:
         print(f"❌ Errore di configurazione: mancante chiave {e}")
         return 1
+    # 'prefix' is missing from config.ini files created before this option
+    # existed — fall back to the original hardcoded behavior.
+    prefix = cfg['Watcher'].get('prefix', 'DOC')
 
     ocr_cfg = {
         'box1': tuple(map(int, cfg['OCR']['box1'].split(','))),
@@ -401,7 +421,7 @@ def run() -> int:
     print(f"\n🔍 Elaborazione file esistenti in: {cartella}")
     if os.path.isdir(cartella):
         for fname in os.listdir(cartella):
-            if fname.startswith('DOC') and fname.endswith('.pdf'):
+            if fname.startswith(prefix) and fname.endswith('.pdf'):
                 _rinomina_pdf(os.path.join(cartella, fname), ocr_cfg, name_cfg)
     else:
         print(f"⚠️ La cartella '{cartella}' non esiste. Il watcher attenderà che venga creata.")
@@ -412,7 +432,7 @@ def run() -> int:
     print(f"\n👀 Monitoraggio avviato su: {cartella}")
     print("   Premi Ctrl+C per fermare.\n")
 
-    handler = CMRHandler(ocr_cfg, name_cfg, delay_riavvio)
+    handler = CMRHandler(ocr_cfg, name_cfg, delay_riavvio, prefix)
     observer = Observer()
     try:
         observer.schedule(handler, cartella, recursive=False)
