@@ -58,15 +58,24 @@ reads and type-converts every value out of the raw `ConfigParser` into plain dic
 parsing step. `prefix` is read with `cfg['Watcher'].get('prefix', 'DOC')` rather than a plain
 subscript, since it was added after the original hardcoded `DOC` filter and older `config.ini` files
 won't have the key — keep that fallback pattern for any new key added to an existing section.
+`box1`/`box2`/`show_rects` follow the same optional-key pattern deliberately: `config.py` never
+prompts for them (no generic crop coordinates make sense across documents), so `ocr_cfg['box1']`/
+`box2'` are `None` until the mouse calibrator (see below) fills them in and writes them back with
+`_save_boxes_to_config`; `show_rects` has no setup prompt at all and only takes effect if a user hand-edits
+`config.ini` to add it.
 
 **Processing pipeline** (`_rinomina_pdf`): `pdf2image.convert_from_path` renders page 1 → `PIL` crops
 the two configured boxes → `pytesseract.image_to_string` OCRs each crop → `_pulisci_nome` strips
 non-word characters, truncates to `max_length`, optionally strips leading zeros → the two cleaned
-strings are joined into the new filename, with `(1)`, `(2)`, ... appended on collision. If `show_rects`
-is `True`, `_calibra_box` opens a Tk window with the rendered page first, letting box1/box2 be redrawn
-by dragging with the mouse (a "Box 1"/"Box 2" toggle picks which one the next drag updates); saving
-persists the new coordinates to `config.ini` via `_save_boxes_to_config` and applies them immediately
-to `ocr_cfg` for the file being processed.
+strings are joined into the new filename, with `(1)`, `(2)`, ... appended on collision. Before OCR,
+`_rinomina_pdf` calibrates the crop boxes via `_calibra_box` whenever `box1`/`box2` are still `None`
+(first PDF ever processed — the calibrator is mandatory then, and cancelling skips that file rather
+than cropping garbage) or whenever `show_rects` is `True` in `config.ini` (opt-in recalibration).
+`_calibra_box` opens a Tk window with the rendered page on a scrollable/zoomable `Canvas` (mouse wheel
+or +/− buttons, scaled around a `base_scale` fit-to-screen and clamped by `MAX_ZOOM`/`MAX_DIM`) with
+colored "Box 1"/"Box 2" selector buttons (colors match the drawn rectangles) picking which box the
+next drag updates; saving persists the new coordinates to `config.ini` via `_save_boxes_to_config` and
+applies them immediately to `ocr_cfg` for the file being processed.
 
 **Watching**: `CMRHandler` (a `watchdog` `FileSystemEventHandler`) reacts to created/moved/modified
 events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to stop

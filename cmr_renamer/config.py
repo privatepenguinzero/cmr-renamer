@@ -84,18 +84,11 @@ def load_or_create_config(config_path: str = None) -> "configparser.ConfigParser
         )
 
         config['OCR'] = {}
-        config['OCR']['box1'] = _prompt_console(
-            "Coordinate box1 — numero documento (x1,y1,x2,y2)", "595,1615,760,1750"
-        )
-        config['OCR']['box2'] = _prompt_console(
-            "Coordinate box2 — ragione sociale (x1,y1,x2,y2)", "230,725,1085,805"
-        )
-        show_rects = _prompt_console(
-            "Mostrare rettangoli di debug? (True/False)", "False"
-        ).lower()
-        config['OCR']['show_rects'] = str(show_rects in ['true', '1', 'yes', 'y'])
         config['OCR']['lang'] = _prompt_console("Lingua OCR (eng/ita/fra)", "eng")
         config['OCR']['dpi'] = _prompt_console("DPI per conversione PDF", "300")
+        # box1/box2 are intentionally not asked here: they have no sensible
+        # generic default and are selected with the mouse on the first PDF
+        # that gets processed (see watcher._rinomina_pdf / _calibra_box).
 
         config['Filename'] = {}
         config['Filename']['max_length'] = _prompt_console(

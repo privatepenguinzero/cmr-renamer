@@ -23,7 +23,7 @@ from watchdog.events import FileSystemEventHandler
 from .config import load_or_create_config
 
 try:
-    from tkinter import Tk, Canvas, Button, Label, Frame
+    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar
     from PIL import ImageTk
     TKINTER_AVAILABLE = True
 except ImportError:
@@ -149,13 +149,18 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         return None
 
     MIN_DRAG = 4  # px — ignore accidental clicks/near-zero drags
+    MAX_ZOOM = 6.0  # relative to the initial fit-to-screen view
+    MAX_DIM = 8000  # px safety cap on the rendered (zoomed) image size
     labels = {
         'box1': "box 1 (numero documento)",
         'box2': "box 2 (ragione sociale)",
     }
     colors = {'box1': 'red', 'box2': 'blue'}
     boxes = {'box1': tuple(box1), 'box2': tuple(box2)}
-    state = {'active': 'box1', 'start': None, 'drag_id': None, 'result': None}
+    state = {
+        'active': 'box1', 'start': None, 'drag_id': None, 'result': None,
+        'zoom': 1.0, 'photo': None,
+    }
     drawn_ids: dict = {}
     select_buttons: dict = {}
 
@@ -163,24 +168,47 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         root = Tk()
         root.title("CMR Renamer - Calibrazione box OCR")
 
-        screen_w = max(root.winfo_screenwidth() - 100, 300)
-        screen_h = max(root.winfo_screenheight() - 200, 300)
-        scale = min(screen_w / img.width, screen_h / img.height, 1.0)
-        disp_w, disp_h = max(int(img.width * scale), 1), max(int(img.height * scale), 1)
+        screen_w = max(root.winfo_screenwidth() - 150, 300)
+        screen_h = max(root.winfo_screenheight() - 260, 300)
+        base_scale = min(screen_w / img.width, screen_h / img.height, 1.0)
+        viewport_w = max(int(img.width * base_scale), 1)
+        viewport_h = max(int(img.height * base_scale), 1)
+        max_zoom = min(
+            MAX_ZOOM,
+            MAX_DIM / (img.width * base_scale),
+            MAX_DIM / (img.height * base_scale),
+        )
 
-        photo = ImageTk.PhotoImage(img.resize((disp_w, disp_h)))
+        top_frame = Frame(root)
+        top_frame.pack(pady=4)
 
-        select_frame = Frame(root)
-        select_frame.pack(pady=4)
+        select_frame = Frame(top_frame)
+        select_frame.pack(side="left")
+
+        zoom_frame = Frame(top_frame)
+        zoom_frame.pack(side="left", padx=20)
 
         label = Label(root, text="")
         label.pack(pady=2)
 
-        canvas = Canvas(root, width=disp_w, height=disp_h, cursor="cross")
-        canvas.pack()
-        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas_frame = Frame(root)
+        canvas_frame.pack()
+
+        canvas = Canvas(canvas_frame, width=viewport_w, height=viewport_h, cursor="cross", bg="#333333")
+        vbar = Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+        hbar = Scrollbar(root, orient="horizontal", command=canvas.xview)
+        canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+        canvas.grid(row=0, column=0)
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.pack(fill="x")
+
+        image_item = canvas.create_image(0, 0, anchor="nw")
+
+        def total_scale():
+            return base_scale * state['zoom']
 
         def draw_box(name):
+            scale = total_scale()
             x1, y1, x2, y2 = [c * scale for c in boxes[name]]
             if name in drawn_ids:
                 canvas.delete(drawn_ids[name])
@@ -188,25 +216,70 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
                 x1, y1, x2, y2, outline=colors[name], width=3
             )
 
-        draw_box('box1')
-        draw_box('box2')
+        def render():
+            scale = total_scale()
+            disp_w = max(int(img.width * scale), 1)
+            disp_h = max(int(img.height * scale), 1)
+            state['photo'] = ImageTk.PhotoImage(img.resize((disp_w, disp_h)))
+            canvas.itemconfig(image_item, image=state['photo'])
+            canvas.configure(scrollregion=(0, 0, disp_w, disp_h))
+            draw_box('box1')
+            draw_box('box2')
+            zoom_label.config(text=f"{int(state['zoom'] * 100)}%")
+
+        def set_zoom(new_zoom):
+            new_zoom = max(1.0, min(new_zoom, max_zoom))
+            if new_zoom == state['zoom']:
+                return
+            state['zoom'] = new_zoom
+            render()
+
+        def zoom_in():
+            set_zoom(state['zoom'] * 1.25)
+
+        def zoom_out():
+            set_zoom(state['zoom'] / 1.25)
+
+        def zoom_reset():
+            set_zoom(1.0)
+
+        def on_mousewheel(event):
+            # Windows/Mac deliver <MouseWheel> with event.delta; Linux uses
+            # separate Button-4/Button-5 events instead (handled below).
+            if event.delta > 0:
+                zoom_in()
+            else:
+                zoom_out()
+
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        canvas.bind("<Button-4>", lambda e: zoom_in())
+        canvas.bind("<Button-5>", lambda e: zoom_out())
+
+        Button(zoom_frame, text="−", command=zoom_out, width=3).pack(side="left")
+        zoom_label = Label(zoom_frame, text="100%", width=6)
+        zoom_label.pack(side="left", padx=4)
+        Button(zoom_frame, text="+", command=zoom_in, width=3).pack(side="left")
+        Button(zoom_frame, text="Reset zoom", command=zoom_reset).pack(side="left", padx=8)
+
+        render()
 
         def set_active(name):
             state['active'] = name
             for n, btn in select_buttons.items():
                 btn.config(relief=("sunken" if n == name else "raised"))
-            label.config(text=f"Box attivo: {labels[name]}. Trascina col mouse per ridisegnarlo.")
+            label.config(text=f"Box attivo: {labels[name]}. Trascina col mouse per ridisegnarlo (rotellina per zoomare).")
 
         for name in ('box1', 'box2'):
             select_buttons[name] = Button(
-                select_frame, text=labels[name], command=lambda n=name: set_active(n)
+                select_frame, text=labels[name], command=lambda n=name: set_active(n),
+                bg=colors[name], fg="white", activebackground=colors[name], activeforeground="white",
             )
             select_buttons[name].pack(side="left", padx=5)
 
         set_active('box1')
 
         def on_press(event):
-            state['start'] = (event.x, event.y)
+            state['start'] = (canvas.canvasx(event.x), canvas.canvasy(event.y))
 
         def on_drag(event):
             if state['start'] is None:
@@ -214,8 +287,9 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
             if state['drag_id'] is not None:
                 canvas.delete(state['drag_id'])
             x0, y0 = state['start']
+            cx, cy = canvas.canvasx(event.x), canvas.canvasy(event.y)
             state['drag_id'] = canvas.create_rectangle(
-                x0, y0, event.x, event.y, outline=colors[state['active']], width=2, dash=(4, 2)
+                x0, y0, cx, cy, outline=colors[state['active']], width=2, dash=(4, 2)
             )
 
         def on_release(event):
@@ -226,11 +300,14 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
                 return
             x0, y0 = state['start']
             state['start'] = None
-            x1, y1 = event.x, event.y
+            x1, y1 = canvas.canvasx(event.x), canvas.canvasy(event.y)
 
             if abs(x1 - x0) < MIN_DRAG or abs(y1 - y0) < MIN_DRAG:
                 return  # too small to be an intentional box — ignore
 
+            scale = total_scale()
+            disp_w = max(int(img.width * scale), 1)
+            disp_h = max(int(img.height * scale), 1)
             x0 = min(max(x0, 0), disp_w)
             x1 = min(max(x1, 0), disp_w)
             y0 = min(max(y0, 0), disp_h)
@@ -273,12 +350,20 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
         immagini = convert_from_path(pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1)
         img = immagini[0]
 
-        if ocr_cfg['show_rects']:
-            nuovi_box = _calibra_box(img, ocr_cfg['box1'], ocr_cfg['box2'])
+        serve_calibrazione = ocr_cfg['box1'] is None or ocr_cfg['box2'] is None
+        if ocr_cfg['show_rects'] or serve_calibrazione:
+            if serve_calibrazione:
+                print("🖱️ Box OCR non ancora configurati: selezionali con il mouse.")
+            nuovi_box = _calibra_box(
+                img, ocr_cfg['box1'] or (0, 0, 0, 0), ocr_cfg['box2'] or (0, 0, 0, 0)
+            )
             if nuovi_box:
                 ocr_cfg['box1'], ocr_cfg['box2'] = nuovi_box
                 _save_boxes_to_config(ocr_cfg['box1'], ocr_cfg['box2'])
                 print(f"✅ Nuove coordinate salvate → box1={ocr_cfg['box1']} box2={ocr_cfg['box2']}")
+            elif serve_calibrazione:
+                print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
+                return
 
         testo1 = pytesseract.image_to_string(
             img.crop(ocr_cfg['box1']), lang=ocr_cfg['lang']
@@ -402,10 +487,16 @@ def run() -> int:
     # existed — fall back to the original hardcoded behavior.
     prefix = cfg['Watcher'].get('prefix', 'DOC')
 
+    # box1/box2 are absent from freshly-created config.ini files (they're
+    # selected with the mouse on the first PDF processed, not prompted for
+    # at setup time); show_rects likewise no longer has a setup prompt and
+    # is only ever set by manually editing config.ini.
+    box1_raw = cfg['OCR'].get('box1')
+    box2_raw = cfg['OCR'].get('box2')
     ocr_cfg = {
-        'box1': tuple(map(int, cfg['OCR']['box1'].split(','))),
-        'box2': tuple(map(int, cfg['OCR']['box2'].split(','))),
-        'show_rects': cfg['OCR'].getboolean('show_rects'),
+        'box1': tuple(map(int, box1_raw.split(','))) if box1_raw else None,
+        'box2': tuple(map(int, box2_raw.split(','))) if box2_raw else None,
+        'show_rects': cfg['OCR'].getboolean('show_rects', fallback=False),
         'lang': cfg['OCR']['lang'],
         'dpi': int(cfg['OCR']['dpi']),
     }
