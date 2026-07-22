@@ -12,14 +12,22 @@ import sys
 import time
 import ctypes  # For Windows console manipulation
 import atexit
+import configparser
 
 import pytesseract
 from pdf2image import convert_from_path
-from PIL import Image, ImageDraw
+from PIL import Image
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from .config import load_or_create_config
+
+try:
+    from tkinter import Tk, Canvas, Button, Label, Frame
+    from PIL import ImageTk
+    TKINTER_AVAILABLE = True
+except ImportError:
+    TKINTER_AVAILABLE = False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -118,6 +126,131 @@ def _file_pronto(path: str, timeout: int = 5) -> bool:
         return False
 
 
+def _save_boxes_to_config(box1: tuple, box2: tuple) -> None:
+    """Salva le nuove coordinate box1/box2 nel config.ini esistente."""
+    config_path = os.path.join(_get_config_dir(), 'config.ini')
+    config = configparser.ConfigParser()
+    config.read(config_path)
+    if 'OCR' not in config:
+        config['OCR'] = {}
+    config['OCR']['box1'] = ','.join(str(int(v)) for v in box1)
+    config['OCR']['box2'] = ','.join(str(int(v)) for v in box2)
+    with open(config_path, 'w') as f:
+        config.write(f)
+
+
+def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
+    """Mostra la pagina e permette di ridisegnare box1/box2 col mouse.
+
+    Ritorna (nuovo_box1, nuovo_box2) se l'utente salva, altrimenti None.
+    """
+    if not TKINTER_AVAILABLE:
+        print("⚠️ tkinter non disponibile: calibrazione box saltata.")
+        return None
+
+    order = ['box1', 'box2']
+    labels = {
+        'box1': "box 1 (numero documento)",
+        'box2': "box 2 (ragione sociale)",
+    }
+    colors = {'box1': 'red', 'box2': 'blue'}
+    boxes = {'box1': tuple(box1), 'box2': tuple(box2)}
+    state = {'step': 0, 'start': None, 'drag_id': None, 'result': None}
+    drawn_ids: dict = {}
+
+    try:
+        root = Tk()
+        root.title("CMR Renamer - Calibrazione box OCR")
+
+        screen_w = max(root.winfo_screenwidth() - 100, 300)
+        screen_h = max(root.winfo_screenheight() - 200, 300)
+        scale = min(screen_w / img.width, screen_h / img.height, 1.0)
+        disp_w, disp_h = max(int(img.width * scale), 1), max(int(img.height * scale), 1)
+
+        photo = ImageTk.PhotoImage(img.resize((disp_w, disp_h)))
+
+        canvas = Canvas(root, width=disp_w, height=disp_h, cursor="cross")
+        canvas.pack()
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+
+        def draw_box(name):
+            x1, y1, x2, y2 = [c * scale for c in boxes[name]]
+            if name in drawn_ids:
+                canvas.delete(drawn_ids[name])
+            drawn_ids[name] = canvas.create_rectangle(
+                x1, y1, x2, y2, outline=colors[name], width=3
+            )
+
+        draw_box('box1')
+        draw_box('box2')
+
+        label = Label(
+            root,
+            text=f"Trascina col mouse per disegnare il {labels[order[0]]}.",
+        )
+        label.pack(pady=4)
+
+        def on_press(event):
+            state['start'] = (event.x, event.y)
+
+        def on_drag(event):
+            if state['drag_id'] is not None:
+                canvas.delete(state['drag_id'])
+            x0, y0 = state['start']
+            name = order[min(state['step'], len(order) - 1)]
+            state['drag_id'] = canvas.create_rectangle(
+                x0, y0, event.x, event.y, outline=colors[name], width=2, dash=(4, 2)
+            )
+
+        def on_release(event):
+            x0, y0 = state['start']
+            x1, y1 = event.x, event.y
+            x0 = min(max(x0, 0), disp_w)
+            x1 = min(max(x1, 0), disp_w)
+            y0 = min(max(y0, 0), disp_h)
+            y1 = min(max(y1, 0), disp_h)
+            x0, x1 = sorted((x0, x1))
+            y0, y1 = sorted((y0, y1))
+
+            name = order[min(state['step'], len(order) - 1)]
+            boxes[name] = (int(x0 / scale), int(y0 / scale), int(x1 / scale), int(y1 / scale))
+            if state['drag_id'] is not None:
+                canvas.delete(state['drag_id'])
+                state['drag_id'] = None
+            draw_box(name)
+
+            if state['step'] < len(order) - 1:
+                state['step'] += 1
+                next_name = order[state['step']]
+                label.config(text=f"Trascina col mouse per disegnare il {labels[next_name]}.")
+            else:
+                label.config(text="Box aggiornati. Premi Salva per confermare (o ridisegna il box 2).")
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+
+        btn_frame = Frame(root)
+        btn_frame.pack(pady=8)
+
+        def on_save():
+            state['result'] = (boxes['box1'], boxes['box2'])
+            root.destroy()
+
+        def on_cancel():
+            state['result'] = None
+            root.destroy()
+
+        Button(btn_frame, text="Salva", command=on_save).pack(side="left", padx=5)
+        Button(btn_frame, text="Annulla", command=on_cancel).pack(side="left", padx=5)
+
+        root.mainloop()
+        return state['result']
+    except Exception as e:
+        print(f"⚠️ Errore durante la calibrazione dei box: {e}")
+        return None
+
+
 def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
     """Esegue OCR e rinomina il PDF con il testo estratto."""
     try:
@@ -125,10 +258,11 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
         img = immagini[0]
 
         if ocr_cfg['show_rects']:
-            draw = ImageDraw.Draw(img)
-            draw.rectangle(ocr_cfg['box1'], outline="red", width=3)
-            draw.rectangle(ocr_cfg['box2'], outline="red", width=3)
-            img.show()
+            nuovi_box = _calibra_box(img, ocr_cfg['box1'], ocr_cfg['box2'])
+            if nuovi_box:
+                ocr_cfg['box1'], ocr_cfg['box2'] = nuovi_box
+                _save_boxes_to_config(ocr_cfg['box1'], ocr_cfg['box2'])
+                print(f"✅ Nuove coordinate salvate → box1={ocr_cfg['box1']} box2={ocr_cfg['box2']}")
 
         testo1 = pytesseract.image_to_string(
             img.crop(ocr_cfg['box1']), lang=ocr_cfg['lang']
