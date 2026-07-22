@@ -44,10 +44,11 @@ jobs:
         shell: cmd
 
       # 7️⃣ Build executable
-      #     Uses main.py as entry point for PyInstaller
+      #     --windowed = no console by default (background mode)
+      #     if config.ini is missing, the app allocates a console for setup
       - name: Build executable
         run: |
-          uv run -- pyinstaller --onefile --name cmr-renamer main.py
+          uv run -- pyinstaller --onefile --windowed --name cmr-renamer main.py
         shell: pwsh
 
       # 8️⃣ Verify executable exists
