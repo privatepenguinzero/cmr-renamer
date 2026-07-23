@@ -197,6 +197,12 @@ def _file_pronto(path: str, timeout: int = 5) -> bool:
 MIN_BOXES = 2
 MAX_BOXES = 5
 
+# Guards the "open calibrator + save config" critical section so the tray's
+# recalibrate action and the per-file auto-calibration (on the watchdog
+# observer thread) can never both hold an open Tk mainloop or write
+# config.ini at the same time.
+_calibration_lock = threading.Lock()
+
 
 def _save_boxes_to_config(boxes: list) -> None:
     """Salva le coordinate di tutti i box (2-5) nel config.ini esistente."""
@@ -507,13 +513,16 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
             print(f"⚠️ Impossibile aprire la cartella: {e}")
 
     def _recalibra(icon, item):
-        root = Tk()
-        root.withdraw()
-        pdf_path = askopenfilename(title="Seleziona un PDF da calibrare", filetypes=[("PDF", "*.pdf")])
-        root.destroy()
-        if not pdf_path:
+        if not _calibration_lock.acquire(blocking=False):
+            print("⚠️ Calibrazione già in corso altrove: riprova più tardi.")
             return
         try:
+            root = Tk()
+            root.withdraw()
+            pdf_path = askopenfilename(title="Seleziona un PDF da calibrare", filetypes=[("PDF", "*.pdf")])
+            root.destroy()
+            if not pdf_path:
+                return
             immagini = convert_from_path(pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1)
             boxes_seed = list(ocr_cfg['boxes'])
             while len(boxes_seed) < MIN_BOXES:
@@ -525,6 +534,8 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
                 print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
         except Exception as e:
             print(f"⚠️ Errore durante la ricalibrazione: {e}")
+        finally:
+            _calibration_lock.release()
 
     def _exit(icon, item):
         icon.stop()
@@ -547,19 +558,27 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
 
         serve_calibrazione = len(ocr_cfg['boxes']) < MIN_BOXES
         if ocr_cfg['show_rects'] or serve_calibrazione:
-            if serve_calibrazione:
-                print("🖱️ Box OCR non ancora configurati: selezionali con il mouse.")
-            boxes_seed = list(ocr_cfg['boxes'])
-            while len(boxes_seed) < MIN_BOXES:
-                boxes_seed.append(_default_box(len(boxes_seed)))
-            nuovi_box = _calibra_box(img, boxes_seed)
-            if nuovi_box:
-                ocr_cfg['boxes'] = nuovi_box
-                _save_boxes_to_config(ocr_cfg['boxes'])
-                print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
-            elif serve_calibrazione:
-                print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
-                return
+            if not _calibration_lock.acquire(blocking=False):
+                print("⚠️ Calibrazione già in corso altrove (es. dal tray): salto per questo file.")
+                if serve_calibrazione:
+                    return
+            else:
+                try:
+                    if serve_calibrazione:
+                        print("🖱️ Box OCR non ancora configurati: selezionali con il mouse.")
+                    boxes_seed = list(ocr_cfg['boxes'])
+                    while len(boxes_seed) < MIN_BOXES:
+                        boxes_seed.append(_default_box(len(boxes_seed)))
+                    nuovi_box = _calibra_box(img, boxes_seed)
+                    if nuovi_box:
+                        ocr_cfg['boxes'] = nuovi_box
+                        _save_boxes_to_config(ocr_cfg['boxes'])
+                        print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
+                    elif serve_calibrazione:
+                        print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
+                        return
+                finally:
+                    _calibration_lock.release()
 
         parti = []
         for box in ocr_cfg['boxes']:
