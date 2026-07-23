@@ -216,10 +216,28 @@ def _load_boxes_from_config(ocr_section) -> list:
     return boxes
 
 
-def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
-    """Mostra la pagina e permette di ridisegnare box1/box2 col mouse.
+BOX_COLORS = ["red", "blue", "green", "orange", "purple"]
 
-    Ritorna (nuovo_box1, nuovo_box2) se l'utente salva, altrimenti None.
+
+def _default_box(index: int) -> tuple:
+    """Rettangolo di default per un nuovo box, offsettato per non sovrapporsi agli altri."""
+    offset = 20 * index
+    return (20 + offset, 20 + offset, 220 + offset, 120 + offset)
+
+
+def _box_label(index: int) -> str:
+    """Etichetta leggibile per il box all'indice 0-based `index`."""
+    semantic = {0: "numero documento", 1: "ragione sociale"}
+    if index in semantic:
+        return f"box {index + 1} ({semantic[index]})"
+    return f"box {index + 1}"
+
+
+def _calibra_box(img: "Image.Image", boxes: list):
+    """Mostra la pagina e permette di ridisegnare 2-5 box col mouse.
+
+    `boxes` è una lista di partenza di 2-5 tuple (x1,y1,x2,y2).
+    Ritorna la nuova lista di box se l'utente salva, altrimenti None.
     """
     if not TKINTER_AVAILABLE:
         print("⚠️ tkinter non disponibile: calibrazione box saltata.")
@@ -228,14 +246,10 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
     MIN_DRAG = 4  # px — ignore accidental clicks/near-zero drags
     MAX_ZOOM = 6.0  # relative to the initial fit-to-screen view
     MAX_DIM = 8000  # px safety cap on the rendered (zoomed) image size
-    labels = {
-        'box1': "box 1 (numero documento)",
-        'box2': "box 2 (ragione sociale)",
-    }
-    colors = {'box1': 'red', 'box2': 'blue'}
-    boxes = {'box1': tuple(box1), 'box2': tuple(box2)}
+
     state = {
-        'active': 'box1', 'start': None, 'drag_id': None, 'result': None,
+        'boxes': list(boxes),
+        'active': 0, 'start': None, 'drag_id': None, 'result': None,
         'zoom': 1.0, 'photo': None,
     }
     drawn_ids: dict = {}
@@ -262,6 +276,9 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         select_frame = Frame(top_frame)
         select_frame.pack(side="left")
 
+        count_frame = Frame(top_frame)
+        count_frame.pack(side="left", padx=20)
+
         zoom_frame = Frame(top_frame)
         zoom_frame.pack(side="left", padx=20)
 
@@ -284,14 +301,21 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         def total_scale():
             return base_scale * state['zoom']
 
-        def draw_box(name):
+        def draw_box(index):
             scale = total_scale()
-            x1, y1, x2, y2 = [c * scale for c in boxes[name]]
-            if name in drawn_ids:
-                canvas.delete(drawn_ids[name])
-            drawn_ids[name] = canvas.create_rectangle(
-                x1, y1, x2, y2, outline=colors[name], width=3
+            x1, y1, x2, y2 = [c * scale for c in state['boxes'][index]]
+            if index in drawn_ids:
+                canvas.delete(drawn_ids[index])
+            drawn_ids[index] = canvas.create_rectangle(
+                x1, y1, x2, y2, outline=BOX_COLORS[index], width=3
             )
+
+        def draw_all_boxes():
+            for old_id in drawn_ids.values():
+                canvas.delete(old_id)
+            drawn_ids.clear()
+            for i in range(len(state['boxes'])):
+                draw_box(i)
 
         def render():
             scale = total_scale()
@@ -300,8 +324,7 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
             state['photo'] = ImageTk.PhotoImage(img.resize((disp_w, disp_h)))
             canvas.itemconfig(image_item, image=state['photo'])
             canvas.configure(scrollregion=(0, 0, disp_w, disp_h))
-            draw_box('box1')
-            draw_box('box2')
+            draw_all_boxes()
             zoom_label.config(text=f"{int(state['zoom'] * 100)}%")
 
         def set_zoom(new_zoom):
@@ -338,22 +361,54 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         Button(zoom_frame, text="+", command=zoom_in, width=3).pack(side="left")
         Button(zoom_frame, text="Reset zoom", command=zoom_reset).pack(side="left", padx=8)
 
+        def set_active(index):
+            state['active'] = index
+            for i, btn in select_buttons.items():
+                btn.config(relief=("sunken" if i == index else "raised"))
+            label.config(text=f"Box attivo: {_box_label(index)}. Trascina col mouse per ridisegnarlo (rotellina per zoomare).")
+
+        def update_count_buttons():
+            add_btn.config(state=("disabled" if len(state['boxes']) >= MAX_BOXES else "normal"))
+            remove_btn.config(state=("disabled" if len(state['boxes']) <= MIN_BOXES else "normal"))
+
+        def rebuild_select_buttons():
+            for btn in select_buttons.values():
+                btn.destroy()
+            select_buttons.clear()
+            for i in range(len(state['boxes'])):
+                btn = Button(
+                    select_frame, text=_box_label(i), command=lambda n=i: set_active(n),
+                    bg=BOX_COLORS[i], fg="white", activebackground=BOX_COLORS[i], activeforeground="white",
+                )
+                btn.pack(side="left", padx=5)
+                select_buttons[i] = btn
+            update_count_buttons()
+
+        def add_box():
+            if len(state['boxes']) >= MAX_BOXES:
+                return
+            state['boxes'].append(_default_box(len(state['boxes'])))
+            rebuild_select_buttons()
+            set_active(len(state['boxes']) - 1)
+            render()
+
+        def remove_box():
+            if len(state['boxes']) <= MIN_BOXES:
+                return
+            removed = state['active']
+            del state['boxes'][removed]
+            rebuild_select_buttons()
+            set_active(max(removed - 1, 0))
+            render()
+
+        add_btn = Button(count_frame, text="+ Box", command=add_box)
+        add_btn.pack(side="left", padx=2)
+        remove_btn = Button(count_frame, text="− Box", command=remove_box)
+        remove_btn.pack(side="left", padx=2)
+
+        rebuild_select_buttons()
+        set_active(0)
         render()
-
-        def set_active(name):
-            state['active'] = name
-            for n, btn in select_buttons.items():
-                btn.config(relief=("sunken" if n == name else "raised"))
-            label.config(text=f"Box attivo: {labels[name]}. Trascina col mouse per ridisegnarlo (rotellina per zoomare).")
-
-        for name in ('box1', 'box2'):
-            select_buttons[name] = Button(
-                select_frame, text=labels[name], command=lambda n=name: set_active(n),
-                bg=colors[name], fg="white", activebackground=colors[name], activeforeground="white",
-            )
-            select_buttons[name].pack(side="left", padx=5)
-
-        set_active('box1')
 
         def on_press(event):
             state['start'] = (canvas.canvasx(event.x), canvas.canvasy(event.y))
@@ -366,7 +421,7 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
             x0, y0 = state['start']
             cx, cy = canvas.canvasx(event.x), canvas.canvasy(event.y)
             state['drag_id'] = canvas.create_rectangle(
-                x0, y0, cx, cy, outline=colors[state['active']], width=2, dash=(4, 2)
+                x0, y0, cx, cy, outline=BOX_COLORS[state['active']], width=2, dash=(4, 2)
             )
 
         def on_release(event):
@@ -392,9 +447,9 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
             x0, x1 = sorted((x0, x1))
             y0, y1 = sorted((y0, y1))
 
-            name = state['active']
-            boxes[name] = (int(x0 / scale), int(y0 / scale), int(x1 / scale), int(y1 / scale))
-            draw_box(name)
+            index = state['active']
+            state['boxes'][index] = (int(x0 / scale), int(y0 / scale), int(x1 / scale), int(y1 / scale))
+            draw_box(index)
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
@@ -404,7 +459,7 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         btn_frame.pack(pady=8)
 
         def on_save():
-            state['result'] = (boxes['box1'], boxes['box2'])
+            state['result'] = list(state['boxes'])
             root.destroy()
 
         def on_cancel():
