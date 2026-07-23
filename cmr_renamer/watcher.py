@@ -90,12 +90,55 @@ def _free_console():
         _console_allocated = False
 
 
+class _RotatingWriter:
+    """File-like object that rotates cmr-renamer.log once it exceeds max_bytes.
+
+    Keeps exactly one backup (`<path>.1`) instead of growing unbounded, without
+    pulling in the `logging` module (this codebase uses plain `print()` with
+    Italian/emoji strings everywhere; migrating every call site to `logging`
+    would be an unrelated, large refactor).
+    """
+
+    def __init__(self, path: str, max_bytes: int = 1_000_000):
+        self.path = path
+        self.max_bytes = max_bytes
+        self._file = open(path, 'a', encoding='utf-8', errors='replace')
+
+    def write(self, data: str) -> int:
+        n = self._file.write(data)
+        self._file.flush()
+        self._maybe_rotate()
+        return n
+
+    def flush(self):
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+    def _maybe_rotate(self):
+        try:
+            if os.path.getsize(self.path) < self.max_bytes:
+                return
+            self._file.close()
+            backup = self.path + '.1'
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.rename(self.path, backup)
+            self._file = open(self.path, 'a', encoding='utf-8', errors='replace')
+        except OSError:
+            # Rotation failed (e.g. permission error) — keep appending to the
+            # existing file rather than losing log output entirely.
+            if self._file.closed:
+                self._file = open(self.path, 'a', encoding='utf-8', errors='replace')
+
+
 def _setup_file_logging(log_dir: str):
-    """Redirect stdout/stderr to a log file in background mode."""
+    """Redirect stdout/stderr to a size-capped, rotating log file in background mode."""
     log_path = os.path.join(log_dir, 'cmr-renamer.log')
-    # Use 'a' for append mode, ensure UTF-8 encoding, replace errors
-    sys.stdout = open(log_path, 'a', encoding='utf-8', errors='replace')
-    sys.stderr = sys.stdout  # Redirect stderr to the same log file
+    writer = _RotatingWriter(log_path)
+    sys.stdout = writer
+    sys.stderr = writer
 
 
 # ──────────────────────────────────────────────────────────────
