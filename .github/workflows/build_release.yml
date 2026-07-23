@@ -16,6 +16,7 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
+          lfs: true
 
       # 2️⃣ Set up Python 3.10
       - name: Set up Python 3.10
@@ -38,17 +39,12 @@ jobs:
         run: uv sync
         shell: pwsh
 
-      # 6️⃣ Install Tesseract OCR (required by pytesseract)
-      - name: Install Tesseract OCR
-        run: choco install -y tesseract
-        shell: cmd
-
-      # 7️⃣ Build executable
+      # 6️⃣ Build executable
       #     --windowed = no console by default (background mode)
       #     if config.ini is missing, the app allocates a console for setup
       - name: Build executable
         run: |
-          uv run -- pyinstaller --onefile --windowed --name cmr-renamer --icon=assets/icon.ico --add-data "assets/icon.ico;assets" main.py
+          uv run -- pyinstaller --onefile --windowed --name cmr-renamer --icon=assets/icon.ico --add-data "assets/icon.ico;assets" --add-data "vendor/poppler;vendor/poppler" --add-data "vendor/tesseract;vendor/tesseract" main.py
         shell: pwsh
 
       # 8️⃣ Verify executable exists
