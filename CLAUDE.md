@@ -21,12 +21,17 @@ python -m cmr_renamer         # equivalent, via __main__.py
 uv run cmr-renamer            # equivalent, via the installed console script
 
 # Build the Windows executable locally (mirrors .github/workflows/build_release.yml)
-uv run -- pyinstaller --onefile --windowed --name cmr-renamer --icon=assets/icon.ico --add-data "assets/icon.ico;assets" main.py
+uv run -- pyinstaller --onefile --windowed --name cmr-renamer --icon=assets/icon.ico --add-data "assets/icon.ico;assets" --add-data "vendor/poppler;vendor/poppler" --add-data "vendor/tesseract;vendor/tesseract" main.py
 ```
 
 There is no test suite, linter, or formatter configured in this repo — don't assume `pytest`/`ruff`
-exist. Tesseract OCR must be installed on the system (`pytesseract` only wraps the binary); the CI
-workflow installs it via `choco install tesseract` on windows-latest.
+exist. Poppler and Tesseract are vendored under `vendor/` (via Git LFS) and bundled into the built
+exe — see "Bundled native dependencies" below. Running from source still needs both installed
+system-wide and on `PATH`, exactly as before this bundling was added; the CI workflow no longer
+installs Tesseract via choco since the build now uses the vendored copy instead.
+
+**Git LFS is required to clone/build this repo**: run `git lfs install` once per machine before
+cloning, otherwise `vendor/` will contain empty LFS pointer files instead of the real binaries.
 
 ## Architecture
 
