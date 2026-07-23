@@ -51,31 +51,36 @@ are all branched inside `run()`:
 **Config lives next to the executable (or CWD when running from source)**, in `config.ini`, and is
 created interactively on first run by `config.py` (`load_or_create_config`). It prefers a tkinter
 folder picker for the watched directory, falling back to console input if tkinter/GUI is unavailable.
-Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1/box2 crop coordinates,
-show_rects debug flag, lang, dpi), `[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
+Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1..box5 crop coordinates
+for 2-5 boxes, show_rects debug flag, lang, dpi), `[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
 reads and type-converts every value out of the raw `ConfigParser` into plain dicts (`ocr_cfg`,
 `name_cfg`) before using them — if you add a config key, update both `config.py`'s prompts and this
 parsing step. `prefix` is read with `cfg['Watcher'].get('prefix', 'DOC')` rather than a plain
 subscript, since it was added after the original hardcoded `DOC` filter and older `config.ini` files
 won't have the key — keep that fallback pattern for any new key added to an existing section.
-`box1`/`box2`/`show_rects` follow the same optional-key pattern deliberately: `config.py` never
-prompts for them (no generic crop coordinates make sense across documents), so `ocr_cfg['box1']`/
-`box2'` are `None` until the mouse calibrator (see below) fills them in and writes them back with
+`box1`..`box5`/`show_rects` follow the same optional-key pattern deliberately: `config.py` never
+prompts for them (no generic crop coordinates make sense across documents), so `ocr_cfg['boxes']`
+is an empty list until the mouse calibrator (see below) fills it in and writes it back with
 `_save_boxes_to_config`; `show_rects` has no setup prompt at all and only takes effect if a user hand-edits
-`config.ini` to add it.
+`config.ini` to add it. The box count is configurable from 2 to 5 (`MIN_BOXES`/`MAX_BOXES` in
+`watcher.py`) via `+`/`−` buttons in the calibrator itself, not a config prompt; existing
+`config.ini` files with only `box1`/`box2` load transparently as a 2-box config.
 
 **Processing pipeline** (`_rinomina_pdf`): `pdf2image.convert_from_path` renders page 1 → `PIL` crops
-the two configured boxes → `pytesseract.image_to_string` OCRs each crop → `_pulisci_nome` strips
-non-word characters, truncates to `max_length`, optionally strips leading zeros → the two cleaned
-strings are joined into the new filename, with `(1)`, `(2)`, ... appended on collision. Before OCR,
-`_rinomina_pdf` calibrates the crop boxes via `_calibra_box` whenever `box1`/`box2` are still `None`
-(first PDF ever processed — the calibrator is mandatory then, and cancelling skips that file rather
-than cropping garbage) or whenever `show_rects` is `True` in `config.ini` (opt-in recalibration).
-`_calibra_box` opens a Tk window with the rendered page on a scrollable/zoomable `Canvas` (mouse wheel
-or +/− buttons, scaled around a `base_scale` fit-to-screen and clamped by `MAX_ZOOM`/`MAX_DIM`) with
-colored "Box 1"/"Box 2" selector buttons (colors match the drawn rectangles) picking which box the
-next drag updates; saving persists the new coordinates to `config.ini` via `_save_boxes_to_config` and
-applies them immediately to `ocr_cfg` for the file being processed.
+each of the 2-5 configured boxes → `_preprocess_for_ocr` (grayscale, autocontrast, fixed threshold)
+improves each crop → `pytesseract.image_to_string` OCRs each preprocessed crop → `_pulisci_nome`
+strips non-word characters, truncates to `max_length`, optionally strips leading zeros → the
+non-empty cleaned strings are joined with a single space into the new filename, with `(1)`, `(2)`,
+... appended on collision. Before OCR, `_rinomina_pdf` calibrates the crop boxes via `_calibra_box`
+whenever fewer than `MIN_BOXES` are configured (first PDF ever processed — the calibrator is
+mandatory then, and cancelling skips that file rather than cropping garbage) or whenever
+`show_rects` is `True` in `config.ini` (opt-in recalibration). `_calibra_box` opens a Tk window with
+the rendered page on a scrollable/zoomable `Canvas` (mouse wheel or +/− buttons, scaled around a
+`base_scale` fit-to-screen and clamped by `MAX_ZOOM`/`MAX_DIM`) with colored, numbered selector
+buttons (one per box, colors match the drawn rectangles) picking which box the next drag updates,
+plus `+ Box`/`− Box` buttons (disabled at 5/2 respectively) to change the box count; saving persists
+the new box list to `config.ini` via `_save_boxes_to_config` and applies it immediately to `ocr_cfg`
+for the file being processed.
 
 **Watching**: `CMRHandler` (a `watchdog` `FileSystemEventHandler`) reacts to created/moved/modified
 events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to stop
@@ -83,6 +88,14 @@ growing (`_file_pronto`, since files typically arrive from a scanner/copier stil
 calls `_rinomina_pdf`. A `processati` dict debounces repeat events per path using `delay_riavvio` from
 config. `run()` also sweeps the watched folder for pre-existing matching files once at startup, before
 starting the observer loop.
+
+**Background mode UI**: when frozen and running in background mode, a system tray icon
+(`pystray`, guarded the same way as the `tkinter` import — missing `pystray` just means no tray,
+not a crash) offers "Apri log", "Apri cartella monitorata", "Ricalibra box" (opens a file picker
+and runs the same `_calibra_box` calibrator against a chosen PDF), and "Esci". This is the only way
+to exit a frozen+windowed instance, since it has no console/Ctrl+C available. Log output in
+background mode goes through `_RotatingWriter`, which caps `cmr-renamer.log` at ~1MB with one
+backup (`cmr-renamer.log.1`) instead of growing unbounded.
 
 **Language note**: user-facing console strings and internal helper names (`_rinomina_pdf`,
 `_pulisci_nome`, `_file_pronto`) are Italian (the tool's target users); docstrings/comments are
