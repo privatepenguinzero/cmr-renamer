@@ -21,7 +21,7 @@ python -m cmr_renamer         # equivalent, via __main__.py
 uv run cmr-renamer            # equivalent, via the installed console script
 
 # Build the Windows executable locally (mirrors .github/workflows/build_release.yml)
-uv run -- pyinstaller --onefile --windowed --name cmr-renamer main.py
+uv run -- pyinstaller --onefile --windowed --name cmr-renamer --icon=assets/icon.ico --add-data "assets/icon.ico;assets" main.py
 ```
 
 There is no test suite, linter, or formatter configured in this repo — don't assume `pytest`/`ruff`
