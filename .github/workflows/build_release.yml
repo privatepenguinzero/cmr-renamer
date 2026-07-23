@@ -48,7 +48,7 @@ jobs:
       #     if config.ini is missing, the app allocates a console for setup
       - name: Build executable
         run: |
-          uv run -- pyinstaller --onefile --windowed --name cmr-renamer main.py
+          uv run -- pyinstaller --onefile --windowed --name cmr-renamer --icon=assets/icon.ico --add-data "assets/icon.ico;assets" main.py
         shell: pwsh
 
       # 8️⃣ Verify executable exists

@@ -12,11 +12,12 @@ import sys
 import time
 import ctypes  # For Windows console manipulation
 import atexit
+import threading
 import configparser
 
 import pytesseract
 from pdf2image import convert_from_path
-from PIL import Image
+from PIL import Image, ImageOps
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -24,10 +25,17 @@ from .config import load_or_create_config
 
 try:
     from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar
+    from tkinter.filedialog import askopenfilename
     from PIL import ImageTk
     TKINTER_AVAILABLE = True
 except ImportError:
     TKINTER_AVAILABLE = False
+
+try:
+    import pystray
+    PYSTRAY_AVAILABLE = True
+except ImportError:
+    PYSTRAY_AVAILABLE = False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -47,6 +55,12 @@ def _get_config_dir() -> str:
     else:
         # Normal Python: config lives in current working directory
         return os.getcwd()
+
+
+def _get_resource_path(relative_path: str) -> str:
+    """Risolve un percorso di risorsa bundled, sia da sorgente che da frozen (PyInstaller onefile)."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(base, relative_path)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -90,12 +104,55 @@ def _free_console():
         _console_allocated = False
 
 
+class _RotatingWriter:
+    """File-like object that rotates cmr-renamer.log once it exceeds max_bytes.
+
+    Keeps exactly one backup (`<path>.1`) instead of growing unbounded, without
+    pulling in the `logging` module (this codebase uses plain `print()` with
+    Italian/emoji strings everywhere; migrating every call site to `logging`
+    would be an unrelated, large refactor).
+    """
+
+    def __init__(self, path: str, max_bytes: int = 1_000_000):
+        self.path = path
+        self.max_bytes = max_bytes
+        self._file = open(path, 'a', encoding='utf-8', errors='replace')
+
+    def write(self, data: str) -> int:
+        n = self._file.write(data)
+        self._file.flush()
+        self._maybe_rotate()
+        return n
+
+    def flush(self):
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+    def _maybe_rotate(self):
+        try:
+            if os.path.getsize(self.path) < self.max_bytes:
+                return
+            self._file.close()
+            backup = self.path + '.1'
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.rename(self.path, backup)
+            self._file = open(self.path, 'a', encoding='utf-8', errors='replace')
+        except OSError:
+            # Rotation failed (e.g. permission error) — keep appending to the
+            # existing file rather than losing log output entirely.
+            if self._file.closed:
+                self._file = open(self.path, 'a', encoding='utf-8', errors='replace')
+
+
 def _setup_file_logging(log_dir: str):
-    """Redirect stdout/stderr to a log file in background mode."""
+    """Redirect stdout/stderr to a size-capped, rotating log file in background mode."""
     log_path = os.path.join(log_dir, 'cmr-renamer.log')
-    # Use 'a' for append mode, ensure UTF-8 encoding, replace errors
-    sys.stdout = open(log_path, 'a', encoding='utf-8', errors='replace')
-    sys.stderr = sys.stdout  # Redirect stderr to the same log file
+    writer = _RotatingWriter(log_path)
+    sys.stdout = writer
+    sys.stderr = writer
 
 
 # ──────────────────────────────────────────────────────────────
@@ -112,6 +169,17 @@ def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     return clean
 
 
+def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
+    """Migliora un crop prima dell'OCR: scala di grigi, contrasto, binarizzazione.
+
+    Soglia fissa (128), non derivata per immagine — punto di partenza pensato
+    per tuning manuale (vedi verifica del piano), non un default definitivo.
+    """
+    gray = img.convert('L')
+    contrasted = ImageOps.autocontrast(gray)
+    return contrasted.point(lambda p: 255 if p > 128 else 0)
+
+
 def _file_pronto(path: str, timeout: int = 5) -> bool:
     """Aspetta che il file sia finito di scrivere dalla fotocopiatrice."""
     try:
@@ -126,23 +194,70 @@ def _file_pronto(path: str, timeout: int = 5) -> bool:
         return False
 
 
-def _save_boxes_to_config(box1: tuple, box2: tuple) -> None:
-    """Salva le nuove coordinate box1/box2 nel config.ini esistente."""
+MIN_BOXES = 2
+MAX_BOXES = 5
+
+# Guards the "open calibrator + save config" critical section so the tray's
+# recalibrate action and the per-file auto-calibration (on the watchdog
+# observer thread) can never both hold an open Tk mainloop or write
+# config.ini at the same time.
+_calibration_lock = threading.Lock()
+
+
+def _save_boxes_to_config(boxes: list) -> None:
+    """Salva le coordinate di tutti i box (2-5) nel config.ini esistente."""
     config_path = os.path.join(_get_config_dir(), 'config.ini')
     config = configparser.ConfigParser()
     config.read(config_path)
     if 'OCR' not in config:
         config['OCR'] = {}
-    config['OCR']['box1'] = ','.join(str(int(v)) for v in box1)
-    config['OCR']['box2'] = ','.join(str(int(v)) for v in box2)
+    for i, box in enumerate(boxes, start=1):
+        config['OCR'][f'box{i}'] = ','.join(str(int(v)) for v in box)
+    # Rimuove eventuali chiavi box(N+1).. rimaste da una configurazione precedente
+    # con più box (es. da 4 box a 3: box4 va eliminato, non lasciato stantio).
+    for i in range(len(boxes) + 1, MAX_BOXES + 1):
+        config['OCR'].pop(f'box{i}', None)
     with open(config_path, 'w') as f:
         config.write(f)
 
 
-def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
-    """Mostra la pagina e permette di ridisegnare box1/box2 col mouse.
+def _load_boxes_from_config(ocr_section) -> list:
+    """Legge box1..box5 da una sezione [OCR] già caricata, in ordine.
 
-    Ritorna (nuovo_box1, nuovo_box2) se l'utente salva, altrimenti None.
+    Si ferma al primo box assente — sufficiente perché _save_boxes_to_config
+    scrive sempre chiavi contigue a partire da box1.
+    """
+    boxes = []
+    for i in range(1, MAX_BOXES + 1):
+        raw = ocr_section.get(f'box{i}')
+        if not raw:
+            break
+        boxes.append(tuple(map(int, raw.split(','))))
+    return boxes
+
+
+BOX_COLORS = ["red", "blue", "green", "orange", "purple"]
+
+
+def _default_box(index: int) -> tuple:
+    """Rettangolo di default per un nuovo box, offsettato per non sovrapporsi agli altri."""
+    offset = 20 * index
+    return (20 + offset, 20 + offset, 220 + offset, 120 + offset)
+
+
+def _box_label(index: int) -> str:
+    """Etichetta leggibile per il box all'indice 0-based `index`."""
+    semantic = {0: "numero documento", 1: "ragione sociale"}
+    if index in semantic:
+        return f"box {index + 1} ({semantic[index]})"
+    return f"box {index + 1}"
+
+
+def _calibra_box(img: "Image.Image", boxes: list):
+    """Mostra la pagina e permette di ridisegnare 2-5 box col mouse.
+
+    `boxes` è una lista di partenza di 2-5 tuple (x1,y1,x2,y2).
+    Ritorna la nuova lista di box se l'utente salva, altrimenti None.
     """
     if not TKINTER_AVAILABLE:
         print("⚠️ tkinter non disponibile: calibrazione box saltata.")
@@ -151,14 +266,10 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
     MIN_DRAG = 4  # px — ignore accidental clicks/near-zero drags
     MAX_ZOOM = 6.0  # relative to the initial fit-to-screen view
     MAX_DIM = 8000  # px safety cap on the rendered (zoomed) image size
-    labels = {
-        'box1': "box 1 (numero documento)",
-        'box2': "box 2 (ragione sociale)",
-    }
-    colors = {'box1': 'red', 'box2': 'blue'}
-    boxes = {'box1': tuple(box1), 'box2': tuple(box2)}
+
     state = {
-        'active': 'box1', 'start': None, 'drag_id': None, 'result': None,
+        'boxes': list(boxes),
+        'active': 0, 'start': None, 'drag_id': None, 'result': None,
         'zoom': 1.0, 'photo': None,
     }
     drawn_ids: dict = {}
@@ -185,6 +296,9 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         select_frame = Frame(top_frame)
         select_frame.pack(side="left")
 
+        count_frame = Frame(top_frame)
+        count_frame.pack(side="left", padx=20)
+
         zoom_frame = Frame(top_frame)
         zoom_frame.pack(side="left", padx=20)
 
@@ -207,14 +321,21 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         def total_scale():
             return base_scale * state['zoom']
 
-        def draw_box(name):
+        def draw_box(index):
             scale = total_scale()
-            x1, y1, x2, y2 = [c * scale for c in boxes[name]]
-            if name in drawn_ids:
-                canvas.delete(drawn_ids[name])
-            drawn_ids[name] = canvas.create_rectangle(
-                x1, y1, x2, y2, outline=colors[name], width=3
+            x1, y1, x2, y2 = [c * scale for c in state['boxes'][index]]
+            if index in drawn_ids:
+                canvas.delete(drawn_ids[index])
+            drawn_ids[index] = canvas.create_rectangle(
+                x1, y1, x2, y2, outline=BOX_COLORS[index], width=3
             )
+
+        def draw_all_boxes():
+            for old_id in drawn_ids.values():
+                canvas.delete(old_id)
+            drawn_ids.clear()
+            for i in range(len(state['boxes'])):
+                draw_box(i)
 
         def render():
             scale = total_scale()
@@ -223,8 +344,7 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
             state['photo'] = ImageTk.PhotoImage(img.resize((disp_w, disp_h)))
             canvas.itemconfig(image_item, image=state['photo'])
             canvas.configure(scrollregion=(0, 0, disp_w, disp_h))
-            draw_box('box1')
-            draw_box('box2')
+            draw_all_boxes()
             zoom_label.config(text=f"{int(state['zoom'] * 100)}%")
 
         def set_zoom(new_zoom):
@@ -261,22 +381,54 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         Button(zoom_frame, text="+", command=zoom_in, width=3).pack(side="left")
         Button(zoom_frame, text="Reset zoom", command=zoom_reset).pack(side="left", padx=8)
 
+        def set_active(index):
+            state['active'] = index
+            for i, btn in select_buttons.items():
+                btn.config(relief=("sunken" if i == index else "raised"))
+            label.config(text=f"Box attivo: {_box_label(index)}. Trascina col mouse per ridisegnarlo (rotellina per zoomare).")
+
+        def update_count_buttons():
+            add_btn.config(state=("disabled" if len(state['boxes']) >= MAX_BOXES else "normal"))
+            remove_btn.config(state=("disabled" if len(state['boxes']) <= MIN_BOXES else "normal"))
+
+        def rebuild_select_buttons():
+            for btn in select_buttons.values():
+                btn.destroy()
+            select_buttons.clear()
+            for i in range(len(state['boxes'])):
+                btn = Button(
+                    select_frame, text=_box_label(i), command=lambda n=i: set_active(n),
+                    bg=BOX_COLORS[i], fg="white", activebackground=BOX_COLORS[i], activeforeground="white",
+                )
+                btn.pack(side="left", padx=5)
+                select_buttons[i] = btn
+            update_count_buttons()
+
+        def add_box():
+            if len(state['boxes']) >= MAX_BOXES:
+                return
+            state['boxes'].append(_default_box(len(state['boxes'])))
+            rebuild_select_buttons()
+            set_active(len(state['boxes']) - 1)
+            render()
+
+        def remove_box():
+            if len(state['boxes']) <= MIN_BOXES:
+                return
+            removed = state['active']
+            del state['boxes'][removed]
+            rebuild_select_buttons()
+            set_active(max(removed - 1, 0))
+            render()
+
+        add_btn = Button(count_frame, text="+ Box", command=add_box)
+        add_btn.pack(side="left", padx=2)
+        remove_btn = Button(count_frame, text="− Box", command=remove_box)
+        remove_btn.pack(side="left", padx=2)
+
+        rebuild_select_buttons()
+        set_active(0)
         render()
-
-        def set_active(name):
-            state['active'] = name
-            for n, btn in select_buttons.items():
-                btn.config(relief=("sunken" if n == name else "raised"))
-            label.config(text=f"Box attivo: {labels[name]}. Trascina col mouse per ridisegnarlo (rotellina per zoomare).")
-
-        for name in ('box1', 'box2'):
-            select_buttons[name] = Button(
-                select_frame, text=labels[name], command=lambda n=name: set_active(n),
-                bg=colors[name], fg="white", activebackground=colors[name], activeforeground="white",
-            )
-            select_buttons[name].pack(side="left", padx=5)
-
-        set_active('box1')
 
         def on_press(event):
             state['start'] = (canvas.canvasx(event.x), canvas.canvasy(event.y))
@@ -289,7 +441,7 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
             x0, y0 = state['start']
             cx, cy = canvas.canvasx(event.x), canvas.canvasy(event.y)
             state['drag_id'] = canvas.create_rectangle(
-                x0, y0, cx, cy, outline=colors[state['active']], width=2, dash=(4, 2)
+                x0, y0, cx, cy, outline=BOX_COLORS[state['active']], width=2, dash=(4, 2)
             )
 
         def on_release(event):
@@ -315,9 +467,9 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
             x0, x1 = sorted((x0, x1))
             y0, y1 = sorted((y0, y1))
 
-            name = state['active']
-            boxes[name] = (int(x0 / scale), int(y0 / scale), int(x1 / scale), int(y1 / scale))
-            draw_box(name)
+            index = state['active']
+            state['boxes'][index] = (int(x0 / scale), int(y0 / scale), int(x1 / scale), int(y1 / scale))
+            draw_box(index)
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
@@ -327,7 +479,7 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         btn_frame.pack(pady=8)
 
         def on_save():
-            state['result'] = (boxes['box1'], boxes['box2'])
+            state['result'] = list(state['boxes'])
             root.destroy()
 
         def on_cancel():
@@ -344,35 +496,99 @@ def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
         return None
 
 
+def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
+                      cartella: str, stop_event: "threading.Event") -> "pystray.Icon":
+    """Crea l'icona di system tray con il menu di controllo del background mode."""
+
+    def _open_log(icon, item):
+        try:
+            os.startfile(log_path)
+        except Exception as e:
+            print(f"⚠️ Impossibile aprire il log: {e}")
+
+    def _open_folder(icon, item):
+        try:
+            os.startfile(cartella)
+        except Exception as e:
+            print(f"⚠️ Impossibile aprire la cartella: {e}")
+
+    def _recalibra(icon, item):
+        if not _calibration_lock.acquire(blocking=False):
+            print("⚠️ Calibrazione già in corso altrove: riprova più tardi.")
+            return
+        try:
+            root = Tk()
+            root.withdraw()
+            pdf_path = askopenfilename(title="Seleziona un PDF da calibrare", filetypes=[("PDF", "*.pdf")])
+            root.destroy()
+            if not pdf_path:
+                return
+            immagini = convert_from_path(pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1)
+            boxes_seed = list(ocr_cfg['boxes'])
+            while len(boxes_seed) < MIN_BOXES:
+                boxes_seed.append(_default_box(len(boxes_seed)))
+            nuovi_box = _calibra_box(immagini[0], boxes_seed)
+            if nuovi_box:
+                ocr_cfg['boxes'] = nuovi_box
+                _save_boxes_to_config(ocr_cfg['boxes'])
+                print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
+        except Exception as e:
+            print(f"⚠️ Errore durante la ricalibrazione: {e}")
+        finally:
+            _calibration_lock.release()
+
+    def _exit(icon, item):
+        icon.stop()
+        stop_event.set()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Apri log", _open_log),
+        pystray.MenuItem("Apri cartella monitorata", _open_folder),
+        pystray.MenuItem("Ricalibra box", _recalibra),
+        pystray.MenuItem("Esci", _exit),
+    )
+    return pystray.Icon("cmr-renamer", icon_image, "CMR Renamer", menu)
+
+
 def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
     """Esegue OCR e rinomina il PDF con il testo estratto."""
     try:
         immagini = convert_from_path(pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1)
         img = immagini[0]
 
-        serve_calibrazione = ocr_cfg['box1'] is None or ocr_cfg['box2'] is None
+        serve_calibrazione = len(ocr_cfg['boxes']) < MIN_BOXES
         if ocr_cfg['show_rects'] or serve_calibrazione:
-            if serve_calibrazione:
-                print("🖱️ Box OCR non ancora configurati: selezionali con il mouse.")
-            nuovi_box = _calibra_box(
-                img, ocr_cfg['box1'] or (0, 0, 0, 0), ocr_cfg['box2'] or (0, 0, 0, 0)
-            )
-            if nuovi_box:
-                ocr_cfg['box1'], ocr_cfg['box2'] = nuovi_box
-                _save_boxes_to_config(ocr_cfg['box1'], ocr_cfg['box2'])
-                print(f"✅ Nuove coordinate salvate → box1={ocr_cfg['box1']} box2={ocr_cfg['box2']}")
-            elif serve_calibrazione:
-                print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
-                return
+            if not _calibration_lock.acquire(blocking=False):
+                print("⚠️ Calibrazione già in corso altrove (es. dal tray): salto per questo file.")
+                if serve_calibrazione:
+                    return
+            else:
+                try:
+                    if serve_calibrazione:
+                        print("🖱️ Box OCR non ancora configurati: selezionali con il mouse.")
+                    boxes_seed = list(ocr_cfg['boxes'])
+                    while len(boxes_seed) < MIN_BOXES:
+                        boxes_seed.append(_default_box(len(boxes_seed)))
+                    nuovi_box = _calibra_box(img, boxes_seed)
+                    if nuovi_box:
+                        ocr_cfg['boxes'] = nuovi_box
+                        _save_boxes_to_config(ocr_cfg['boxes'])
+                        print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
+                    elif serve_calibrazione:
+                        print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
+                        return
+                finally:
+                    _calibration_lock.release()
 
-        testo1 = pytesseract.image_to_string(
-            img.crop(ocr_cfg['box1']), lang=ocr_cfg['lang']
-        )
-        testo2 = pytesseract.image_to_string(
-            img.crop(ocr_cfg['box2']), lang=ocr_cfg['lang']
-        )
+        parti = []
+        for box in ocr_cfg['boxes']:
+            crop = _preprocess_for_ocr(img.crop(box))
+            testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'])
+            pulito = _pulisci_nome(testo, name_cfg['max_length'], name_cfg['remove_leading_zeros'])
+            if pulito:
+                parti.append(pulito)
 
-        base = f"{_pulisci_nome(testo1, name_cfg['max_length'], name_cfg['remove_leading_zeros'])} {_pulisci_nome(testo2, name_cfg['max_length'], name_cfg['remove_leading_zeros'])}".strip()
+        base = " ".join(parti).strip()
         if not base:
             base = "documento_senza_nome"
 
@@ -487,15 +703,12 @@ def run() -> int:
     # existed — fall back to the original hardcoded behavior.
     prefix = cfg['Watcher'].get('prefix', 'DOC')
 
-    # box1/box2 are absent from freshly-created config.ini files (they're
-    # selected with the mouse on the first PDF processed, not prompted for
-    # at setup time); show_rects likewise no longer has a setup prompt and
-    # is only ever set by manually editing config.ini.
-    box1_raw = cfg['OCR'].get('box1')
-    box2_raw = cfg['OCR'].get('box2')
+    # box1..box5 are absent from freshly-created config.ini files (the box
+    # count and coordinates are selected with the mouse on the first PDF
+    # processed, not prompted for at setup time); show_rects likewise has no
+    # setup prompt and only takes effect if a user hand-edits config.ini.
     ocr_cfg = {
-        'box1': tuple(map(int, box1_raw.split(','))) if box1_raw else None,
-        'box2': tuple(map(int, box2_raw.split(','))) if box2_raw else None,
+        'boxes': _load_boxes_from_config(cfg['OCR']),
         'show_rects': cfg['OCR'].getboolean('show_rects', fallback=False),
         'lang': cfg['OCR']['lang'],
         'dpi': int(cfg['OCR']['dpi']),
@@ -535,13 +748,28 @@ def run() -> int:
         print(f"❌ Errore durante l'avvio del watcher: {e}")
         return 1 # Indicate error
 
+    tray_icon = None
+    stop_event = threading.Event()
+    if _is_frozen() and PYSTRAY_AVAILABLE:
+        try:
+            icon_image = Image.open(_get_resource_path(os.path.join('assets', 'icon.ico')))
+            log_path = os.path.join(config_dir, 'cmr-renamer.log')
+            tray_icon = _build_tray_icon(icon_image, ocr_cfg, log_path, cartella, stop_event)
+            threading.Thread(target=tray_icon.run, daemon=True).start()
+        except Exception as e:
+            print(f"⚠️ Icona di system tray non disponibile: {e}")
+            tray_icon = None
+
     try:
-        while True:
-            time.sleep(1)
+        if tray_icon is not None:
+            stop_event.wait()
+        else:
+            while True:
+                time.sleep(1)
     except KeyboardInterrupt:
         print("\n🛑 Arresto...")
-        observer.stop()
 
+    observer.stop()
     observer.join()
     print("👋 Monitoraggio terminato.")
     return 0
