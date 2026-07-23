@@ -63,6 +63,20 @@ def _get_resource_path(relative_path: str) -> str:
     return os.path.join(base, relative_path)
 
 
+def _get_poppler_path() -> "str | None":
+    """Percorso ai binari poppler bundled quando frozen; None altrimenti (usa il PATH di sistema)."""
+    if not _is_frozen():
+        return None
+    return _get_resource_path(os.path.join('vendor', 'poppler', 'bin'))
+
+
+def _get_tesseract_cmd() -> "str | None":
+    """Percorso al tesseract.exe bundled quando frozen; None altrimenti (usa il PATH di sistema)."""
+    if not _is_frozen():
+        return None
+    return _get_resource_path(os.path.join('vendor', 'tesseract', 'bin', 'tesseract.exe'))
+
+
 # ──────────────────────────────────────────────────────────────
 # Console management (Windows only)
 # ──────────────────────────────────────────────────────────────
@@ -523,7 +537,10 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
             root.destroy()
             if not pdf_path:
                 return
-            immagini = convert_from_path(pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1)
+            immagini = convert_from_path(
+                pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1,
+                poppler_path=_get_poppler_path(),
+            )
             boxes_seed = list(ocr_cfg['boxes'])
             while len(boxes_seed) < MIN_BOXES:
                 boxes_seed.append(_default_box(len(boxes_seed)))
@@ -553,7 +570,10 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
 def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
     """Esegue OCR e rinomina il PDF con il testo estratto."""
     try:
-        immagini = convert_from_path(pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1)
+        immagini = convert_from_path(
+            pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1,
+            poppler_path=_get_poppler_path(),
+        )
         img = immagini[0]
 
         serve_calibrazione = len(ocr_cfg['boxes']) < MIN_BOXES
@@ -691,6 +711,13 @@ def run() -> int:
     else:
         # Normal Python execution → use console as-is
         cfg = load_or_create_config(config_path=config_path)
+
+    # ── Bundled native tools (frozen only) ──────────────────
+    if _is_frozen():
+        tess_cmd = _get_tesseract_cmd()
+        if tess_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tess_cmd
+            os.environ['TESSDATA_PREFIX'] = _get_resource_path(os.path.join('vendor', 'tesseract', 'tessdata'))
 
     # ── Parse config ───────────────────────────────────────
     try:
