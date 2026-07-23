@@ -482,29 +482,31 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
         immagini = convert_from_path(pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1)
         img = immagini[0]
 
-        serve_calibrazione = ocr_cfg['box1'] is None or ocr_cfg['box2'] is None
+        serve_calibrazione = len(ocr_cfg['boxes']) < MIN_BOXES
         if ocr_cfg['show_rects'] or serve_calibrazione:
             if serve_calibrazione:
                 print("🖱️ Box OCR non ancora configurati: selezionali con il mouse.")
-            nuovi_box = _calibra_box(
-                img, ocr_cfg['box1'] or (0, 0, 0, 0), ocr_cfg['box2'] or (0, 0, 0, 0)
-            )
+            boxes_seed = list(ocr_cfg['boxes'])
+            while len(boxes_seed) < MIN_BOXES:
+                boxes_seed.append(_default_box(len(boxes_seed)))
+            nuovi_box = _calibra_box(img, boxes_seed)
             if nuovi_box:
-                ocr_cfg['box1'], ocr_cfg['box2'] = nuovi_box
-                _save_boxes_to_config(ocr_cfg['box1'], ocr_cfg['box2'])
-                print(f"✅ Nuove coordinate salvate → box1={ocr_cfg['box1']} box2={ocr_cfg['box2']}")
+                ocr_cfg['boxes'] = nuovi_box
+                _save_boxes_to_config(ocr_cfg['boxes'])
+                print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
             elif serve_calibrazione:
                 print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
                 return
 
-        testo1 = pytesseract.image_to_string(
-            img.crop(ocr_cfg['box1']), lang=ocr_cfg['lang']
-        )
-        testo2 = pytesseract.image_to_string(
-            img.crop(ocr_cfg['box2']), lang=ocr_cfg['lang']
-        )
+        parti = []
+        for box in ocr_cfg['boxes']:
+            crop = _preprocess_for_ocr(img.crop(box))
+            testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'])
+            pulito = _pulisci_nome(testo, name_cfg['max_length'], name_cfg['remove_leading_zeros'])
+            if pulito:
+                parti.append(pulito)
 
-        base = f"{_pulisci_nome(testo1, name_cfg['max_length'], name_cfg['remove_leading_zeros'])} {_pulisci_nome(testo2, name_cfg['max_length'], name_cfg['remove_leading_zeros'])}".strip()
+        base = " ".join(parti).strip()
         if not base:
             base = "documento_senza_nome"
 
@@ -619,15 +621,12 @@ def run() -> int:
     # existed — fall back to the original hardcoded behavior.
     prefix = cfg['Watcher'].get('prefix', 'DOC')
 
-    # box1/box2 are absent from freshly-created config.ini files (they're
-    # selected with the mouse on the first PDF processed, not prompted for
-    # at setup time); show_rects likewise no longer has a setup prompt and
-    # is only ever set by manually editing config.ini.
-    box1_raw = cfg['OCR'].get('box1')
-    box2_raw = cfg['OCR'].get('box2')
+    # box1..box5 are absent from freshly-created config.ini files (the box
+    # count and coordinates are selected with the mouse on the first PDF
+    # processed, not prompted for at setup time); show_rects likewise has no
+    # setup prompt and only takes effect if a user hand-edits config.ini.
     ocr_cfg = {
-        'box1': tuple(map(int, box1_raw.split(','))) if box1_raw else None,
-        'box2': tuple(map(int, box2_raw.split(','))) if box2_raw else None,
+        'boxes': _load_boxes_from_config(cfg['OCR']),
         'show_rects': cfg['OCR'].getboolean('show_rects', fallback=False),
         'lang': cfg['OCR']['lang'],
         'dpi': int(cfg['OCR']['dpi']),
