@@ -16,7 +16,7 @@ import configparser
 
 import pytesseract
 from pdf2image import convert_from_path
-from PIL import Image
+from PIL import Image, ImageOps
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -153,6 +153,17 @@ def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     if rimuovi_zeri:
         clean = re.sub(r'^0+', '', clean)
     return clean
+
+
+def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
+    """Migliora un crop prima dell'OCR: scala di grigi, contrasto, binarizzazione.
+
+    Soglia fissa (128), non derivata per immagine — punto di partenza pensato
+    per tuning manuale (vedi verifica del piano), non un default definitivo.
+    """
+    gray = img.convert('L')
+    contrasted = ImageOps.autocontrast(gray)
+    return contrasted.point(lambda p: 255 if p > 128 else 0)
 
 
 def _file_pronto(path: str, timeout: int = 5) -> bool:
