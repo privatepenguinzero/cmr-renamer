@@ -180,17 +180,40 @@ def _file_pronto(path: str, timeout: int = 5) -> bool:
         return False
 
 
-def _save_boxes_to_config(box1: tuple, box2: tuple) -> None:
-    """Salva le nuove coordinate box1/box2 nel config.ini esistente."""
+MIN_BOXES = 2
+MAX_BOXES = 5
+
+
+def _save_boxes_to_config(boxes: list) -> None:
+    """Salva le coordinate di tutti i box (2-5) nel config.ini esistente."""
     config_path = os.path.join(_get_config_dir(), 'config.ini')
     config = configparser.ConfigParser()
     config.read(config_path)
     if 'OCR' not in config:
         config['OCR'] = {}
-    config['OCR']['box1'] = ','.join(str(int(v)) for v in box1)
-    config['OCR']['box2'] = ','.join(str(int(v)) for v in box2)
+    for i, box in enumerate(boxes, start=1):
+        config['OCR'][f'box{i}'] = ','.join(str(int(v)) for v in box)
+    # Rimuove eventuali chiavi box(N+1).. rimaste da una configurazione precedente
+    # con più box (es. da 4 box a 3: box4 va eliminato, non lasciato stantio).
+    for i in range(len(boxes) + 1, MAX_BOXES + 1):
+        config['OCR'].pop(f'box{i}', None)
     with open(config_path, 'w') as f:
         config.write(f)
+
+
+def _load_boxes_from_config(ocr_section) -> list:
+    """Legge box1..box5 da una sezione [OCR] già caricata, in ordine.
+
+    Si ferma al primo box assente — sufficiente perché _save_boxes_to_config
+    scrive sempre chiavi contigue a partire da box1.
+    """
+    boxes = []
+    for i in range(1, MAX_BOXES + 1):
+        raw = ocr_section.get(f'box{i}')
+        if not raw:
+            break
+        boxes.append(tuple(map(int, raw.split(','))))
+    return boxes
 
 
 def _calibra_box(img: "Image.Image", box1: tuple, box2: tuple):
