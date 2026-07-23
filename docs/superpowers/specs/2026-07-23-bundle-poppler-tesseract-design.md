@@ -17,16 +17,29 @@ build so the shipped exe is fully self-contained.
 
 - **Poppler**: the community-standard portable Windows build from
   [`oschwartz10612/poppler-windows`](https://github.com/oschwartz10612/poppler-windows) releases
-  (win64 only — this app already targets modern 64-bit Windows). Vendored to `vendor/poppler/bin/`
-  (the `.exe`s and their dependency `.dll`s) plus `vendor/poppler/COPYING` (poppler's GPL license
-  text).
-- **Tesseract**: extracted from the UB-Mannheim Windows installer — the same build the CI workflow
-  already installs today via `choco install tesseract`. The installer is an NSIS `.exe`, extracted
-  with `7z x` to pull out `tesseract.exe`, its dependency `.dll`s, and only the two needed
-  `tessdata/*.traineddata` files: `eng.traineddata` (the config default) and `ita.traineddata` (the
-  tool's actual target users, per `CLAUDE.md`'s note that its console strings/identifiers are
-  Italian). Vendored to `vendor/tesseract/bin/` and `vendor/tesseract/tessdata/`, plus
-  `vendor/tesseract/LICENSE` (Apache 2.0).
+  (win64 only — this app already targets modern 64-bit Windows). Confirmed during design research:
+  release `v26.02.0-0`'s zip contains a `Library/bin/` folder with all 39 `.exe`/`.dll` files
+  (~24.6MB uncompressed) plus `share/poppler/COPYING`/`COPYING.gpl2` (license text). The whole
+  `Library/bin/` folder is vendored as-is to `vendor/poppler/bin/` — cherry-picking a subset of
+  DLLs risks a missing transitive dependency that can't be caught without a Windows machine to test
+  on, so the safer choice is vendoring the complete, known-working folder.
+- **Tesseract**: the UB-Mannheim Windows installer (`v5.4.0.20240606`, the same build the CI
+  workflow already installs today via `choco install tesseract`) is an NSIS installer, not a
+  portable zip — but `7z x <installer>.exe` cleanly extracts it (confirmed during design research:
+  139 files, including `tesseract.exe` and ~60 dependency `.dll`s at the extraction root, plus a
+  `tessdata/` folder). **The installer only bundles `eng.traineddata` + `osd.traineddata` — it does
+  NOT include `ita.traineddata`** (additional languages are fetched separately by the installer's
+  own UI at install time, not embedded in the exe). `ita.traineddata` is sourced instead from the
+  official [`tesseract-ocr/tessdata_fast`](https://github.com/tesseract-ocr/tessdata_fast) repo
+  (2.7MB). For consistency, `eng.traineddata` is taken from that same `tessdata_fast` repo rather
+  than the installer's copy — confirmed byte-identical in size (4,113,088 bytes) to the installer's
+  bundled file, so this is a lossless substitution that makes both languages consistently sourced.
+  `osd.traineddata` (10.5MB, orientation/script detection) is kept even though this app's fixed-box
+  cropping likely never needs it — its exclusion can't be verified without a working `tesseract`
+  binary (see Testing), so it's included as cheap insurance rather than an unverified guess.
+  Vendored to `vendor/tesseract/bin/` (binaries) and `vendor/tesseract/tessdata/` (the three
+  `.traineddata` files), plus `vendor/tesseract/LICENSE` (Apache 2.0, fetched from the
+  `tesseract-ocr/tesseract` repo).
 - Both are vendored **once**, during implementation, as static committed files — not re-fetched or
   re-extracted on every CI run.
 - A user who sets a different OCR language in `config.ini` (anything other than `eng`/`ita`) still
@@ -108,18 +121,21 @@ def _get_tesseract_cmd() -> str | None:
 ## 6. Testing
 
 No automated test suite exists in this repo (per `CLAUDE.md`) — verification is a mix of what's
-actually runnable in this sandbox and what needs a real Windows machine:
+actually runnable in this sandbox and what needs a real Windows machine. **Correction from initial
+design research: this sandbox does NOT have a runnable `tesseract` CLI binary** (only its shared
+libraries are installed as an OS package, no `tesseract` executable, and there's no passwordless
+package-install available to add one) — so no local OCR execution is possible here at all, for
+either poppler or tesseract. This narrows what's checkable before a human tests on Windows:
 
-- **Runnable here**: this Linux sandbox already has tesseract installed, which lets one real check
-  happen before committing to vendoring only two `.traineddata` files — set `TESSDATA_PREFIX` to a
-  directory containing only `eng.traineddata` + `ita.traineddata` (no `osd.traineddata` or others)
-  and confirm `pytesseract.image_to_string` still succeeds on a test image. This validates the
-  "minimal tessdata set" assumption independent of the Windows binaries themselves.
+- **Runnable here**: confirming the vendored file sets are structurally correct — right files
+  present at the right paths, right total size, valid zip/executable extraction — via `unzip -l`/
+  `7z x`/`find`/`ls`, without executing any of the binaries.
 - **Runnable here**: `_get_poppler_path()`/`_get_tesseract_cmd()`'s pure-Python frozen/non-frozen
   branching, via the same `sys.frozen`-mocking approach used for `_get_resource_path` previously.
 - **Manual, Windows-only**: actually invoking the bundled `pdftoppm.exe`/`tesseract.exe` from a
-  built exe — this sandbox has no Windows environment. Same category as the tray/calibrator manual
-  verification already pending from the prior branch.
+  built exe, and confirming OCR still works with the `eng`+`ita`+`osd` tessdata set — this sandbox
+  has no Windows environment and no working tesseract binary to cross-check against. Same category
+  as the tray/calibrator manual verification already pending from the prior branch.
 
 ## Out of scope
 
