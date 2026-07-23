@@ -9,6 +9,7 @@ dependencies = [
     "pillow",
     "pytesseract",
     "pdf2image",
+    "pystray",
 ]
 
 [project.scripts]

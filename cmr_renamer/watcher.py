@@ -12,6 +12,7 @@ import sys
 import time
 import ctypes  # For Windows console manipulation
 import atexit
+import threading
 import configparser
 
 import pytesseract
@@ -24,10 +25,17 @@ from .config import load_or_create_config
 
 try:
     from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar
+    from tkinter.filedialog import askopenfilename
     from PIL import ImageTk
     TKINTER_AVAILABLE = True
 except ImportError:
     TKINTER_AVAILABLE = False
+
+try:
+    import pystray
+    PYSTRAY_AVAILABLE = True
+except ImportError:
+    PYSTRAY_AVAILABLE = False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -47,6 +55,12 @@ def _get_config_dir() -> str:
     else:
         # Normal Python: config lives in current working directory
         return os.getcwd()
+
+
+def _get_resource_path(relative_path: str) -> str:
+    """Risolve un percorso di risorsa bundled, sia da sorgente che da frozen (PyInstaller onefile)."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(base, relative_path)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -476,6 +490,55 @@ def _calibra_box(img: "Image.Image", boxes: list):
         return None
 
 
+def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
+                      cartella: str, stop_event: "threading.Event") -> "pystray.Icon":
+    """Crea l'icona di system tray con il menu di controllo del background mode."""
+
+    def _open_log(icon, item):
+        try:
+            os.startfile(log_path)
+        except Exception as e:
+            print(f"⚠️ Impossibile aprire il log: {e}")
+
+    def _open_folder(icon, item):
+        try:
+            os.startfile(cartella)
+        except Exception as e:
+            print(f"⚠️ Impossibile aprire la cartella: {e}")
+
+    def _recalibra(icon, item):
+        root = Tk()
+        root.withdraw()
+        pdf_path = askopenfilename(title="Seleziona un PDF da calibrare", filetypes=[("PDF", "*.pdf")])
+        root.destroy()
+        if not pdf_path:
+            return
+        try:
+            immagini = convert_from_path(pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1)
+            boxes_seed = list(ocr_cfg['boxes'])
+            while len(boxes_seed) < MIN_BOXES:
+                boxes_seed.append(_default_box(len(boxes_seed)))
+            nuovi_box = _calibra_box(immagini[0], boxes_seed)
+            if nuovi_box:
+                ocr_cfg['boxes'] = nuovi_box
+                _save_boxes_to_config(ocr_cfg['boxes'])
+                print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
+        except Exception as e:
+            print(f"⚠️ Errore durante la ricalibrazione: {e}")
+
+    def _exit(icon, item):
+        icon.stop()
+        stop_event.set()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Apri log", _open_log),
+        pystray.MenuItem("Apri cartella monitorata", _open_folder),
+        pystray.MenuItem("Ricalibra box", _recalibra),
+        pystray.MenuItem("Esci", _exit),
+    )
+    return pystray.Icon("cmr-renamer", icon_image, "CMR Renamer", menu)
+
+
 def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
     """Esegue OCR e rinomina il PDF con il testo estratto."""
     try:
@@ -666,13 +729,28 @@ def run() -> int:
         print(f"❌ Errore durante l'avvio del watcher: {e}")
         return 1 # Indicate error
 
+    tray_icon = None
+    stop_event = threading.Event()
+    if _is_frozen() and PYSTRAY_AVAILABLE:
+        try:
+            icon_image = Image.open(_get_resource_path(os.path.join('assets', 'icon.ico')))
+            log_path = os.path.join(config_dir, 'cmr-renamer.log')
+            tray_icon = _build_tray_icon(icon_image, ocr_cfg, log_path, cartella, stop_event)
+            threading.Thread(target=tray_icon.run, daemon=True).start()
+        except Exception as e:
+            print(f"⚠️ Icona di system tray non disponibile: {e}")
+            tray_icon = None
+
     try:
-        while True:
-            time.sleep(1)
+        if tray_icon is not None:
+            stop_event.wait()
+        else:
+            while True:
+                time.sleep(1)
     except KeyboardInterrupt:
         print("\n🛑 Arresto...")
-        observer.stop()
 
+    observer.stop()
     observer.join()
     print("👋 Monitoraggio terminato.")
     return 0
