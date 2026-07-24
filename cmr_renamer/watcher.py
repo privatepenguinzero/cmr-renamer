@@ -24,8 +24,7 @@ from watchdog.events import FileSystemEventHandler
 from .config import load_or_create_config
 
 try:
-    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar
-    from tkinter.filedialog import askopenfilename
+    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox
     from PIL import ImageTk
     TKINTER_AVAILABLE = True
 except ImportError:
@@ -183,6 +182,15 @@ def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     return clean
 
 
+def _render_pdf_page(path: str, dpi: int) -> "Image.Image":
+    """Renderizza la pagina 1 di un PDF come immagine PIL."""
+    immagini = convert_from_path(
+        path, dpi=dpi, first_page=1, last_page=1,
+        poppler_path=_get_poppler_path(),
+    )
+    return immagini[0]
+
+
 def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
     """Migliora un crop prima dell'OCR: scala di grigi, contrasto, binarizzazione.
 
@@ -267,11 +275,22 @@ def _box_label(index: int) -> str:
     return f"box {index + 1}"
 
 
-def _calibra_box(img: "Image.Image", boxes: list):
-    """Mostra la pagina e permette di ridisegnare 2-5 box col mouse.
+def _list_watched_pdfs(folder: str) -> list:
+    """Elenca i percorsi assoluti dei PDF nella cartella, ordinati per nome file."""
+    if not os.path.isdir(folder):
+        return []
+    nomi = sorted(f for f in os.listdir(folder) if f.endswith('.pdf'))
+    return [os.path.join(folder, f) for f in nomi]
 
-    `boxes` è una lista di partenza di 2-5 tuple (x1,y1,x2,y2).
-    Ritorna la nuova lista di box se l'utente salva, altrimenti None.
+
+def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
+    """Mostra la pagina 1 di un PDF a scelta tra `pdf_paths` e permette di ridisegnare 2-5 box col mouse.
+
+    `pdf_paths` è l'elenco dei PDF della cartella monitorata, selezionabili da una lista laterale
+    per confrontare visivamente se i box calibrati si applicano bene a più documenti; il cambio file
+    ridisegna solo l'immagine di sfondo, i box restano nelle stesse coordinate. `initial_path` è il
+    file mostrato all'apertura (preselezionato in lista). `boxes` è una lista di partenza di 2-5
+    tuple (x1,y1,x2,y2). Ritorna la nuova lista di box se l'utente salva, altrimenti None.
     """
     if not TKINTER_AVAILABLE:
         print("⚠️ tkinter non disponibile: calibrazione box saltata.")
@@ -281,27 +300,35 @@ def _calibra_box(img: "Image.Image", boxes: list):
     MAX_ZOOM = 6.0  # relative to the initial fit-to-screen view
     MAX_DIM = 8000  # px safety cap on the rendered (zoomed) image size
 
+    image_cache: dict = {}
+
+    def get_image(path: str) -> "Image.Image":
+        if path not in image_cache:
+            image_cache[path] = _render_pdf_page(path, dpi)
+        return image_cache[path]
+
     state = {
         'boxes': list(boxes),
         'active': 0, 'start': None, 'drag_id': None, 'result': None,
-        'zoom': 1.0, 'photo': None,
+        'zoom': 1.0, 'photo': None, 'img': None, 'current_path': initial_path,
     }
     drawn_ids: dict = {}
     select_buttons: dict = {}
 
     try:
+        state['img'] = get_image(initial_path)
         root = Tk()
         root.title("CMR Renamer - Calibrazione box OCR")
 
         screen_w = max(root.winfo_screenwidth() - 150, 300)
         screen_h = max(root.winfo_screenheight() - 260, 300)
-        base_scale = min(screen_w / img.width, screen_h / img.height, 1.0)
-        viewport_w = max(int(img.width * base_scale), 1)
-        viewport_h = max(int(img.height * base_scale), 1)
+        base_scale = min(screen_w / state['img'].width, screen_h / state['img'].height, 1.0)
+        viewport_w = max(int(state['img'].width * base_scale), 1)
+        viewport_h = max(int(state['img'].height * base_scale), 1)
         max_zoom = min(
             MAX_ZOOM,
-            MAX_DIM / (img.width * base_scale),
-            MAX_DIM / (img.height * base_scale),
+            MAX_DIM / (state['img'].width * base_scale),
+            MAX_DIM / (state['img'].height * base_scale),
         )
 
         top_frame = Frame(root)
@@ -319,8 +346,28 @@ def _calibra_box(img: "Image.Image", boxes: list):
         label = Label(root, text="")
         label.pack(pady=2)
 
-        canvas_frame = Frame(root)
-        canvas_frame.pack()
+        body_frame = Frame(root)
+        body_frame.pack()
+
+        sidebar_frame = Frame(body_frame)
+        sidebar_frame.pack(side="left", fill="y", padx=(4, 4))
+
+        Label(sidebar_frame, text="File nella cartella:").pack(anchor="w")
+        file_listbox = Listbox(sidebar_frame, width=32, height=28, exportselection=False)
+        file_scrollbar = Scrollbar(sidebar_frame, orient="vertical", command=file_listbox.yview)
+        file_listbox.configure(yscrollcommand=file_scrollbar.set)
+        file_listbox.pack(side="left", fill="y")
+        file_scrollbar.pack(side="left", fill="y")
+
+        for path in pdf_paths:
+            file_listbox.insert("end", os.path.basename(path))
+        if initial_path in pdf_paths:
+            initial_index = pdf_paths.index(initial_path)
+            file_listbox.selection_set(initial_index)
+            file_listbox.see(initial_index)
+
+        canvas_frame = Frame(body_frame)
+        canvas_frame.pack(side="left")
 
         canvas = Canvas(canvas_frame, width=viewport_w, height=viewport_h, cursor="cross", bg="#333333")
         vbar = Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
@@ -353,9 +400,9 @@ def _calibra_box(img: "Image.Image", boxes: list):
 
         def render():
             scale = total_scale()
-            disp_w = max(int(img.width * scale), 1)
-            disp_h = max(int(img.height * scale), 1)
-            state['photo'] = ImageTk.PhotoImage(img.resize((disp_w, disp_h)))
+            disp_w = max(int(state['img'].width * scale), 1)
+            disp_h = max(int(state['img'].height * scale), 1)
+            state['photo'] = ImageTk.PhotoImage(state['img'].resize((disp_w, disp_h)))
             canvas.itemconfig(image_item, image=state['photo'])
             canvas.configure(scrollregion=(0, 0, disp_w, disp_h))
             draw_all_boxes()
@@ -440,6 +487,26 @@ def _calibra_box(img: "Image.Image", boxes: list):
         remove_btn = Button(count_frame, text="− Box", command=remove_box)
         remove_btn.pack(side="left", padx=2)
 
+        def on_file_select(event=None):
+            selection = file_listbox.curselection()
+            if not selection:
+                return
+            path = pdf_paths[selection[0]]
+            if path == state['current_path']:
+                return
+            try:
+                new_img = get_image(path)
+            except Exception as e:
+                print(f"⚠️ Impossibile aprire '{os.path.basename(path)}': {e}")
+                file_listbox.selection_clear(0, "end")
+                file_listbox.selection_set(pdf_paths.index(state['current_path']))
+                return
+            state['img'] = new_img
+            state['current_path'] = path
+            render()
+
+        file_listbox.bind("<<ListboxSelect>>", on_file_select)
+
         rebuild_select_buttons()
         set_active(0)
         render()
@@ -472,8 +539,8 @@ def _calibra_box(img: "Image.Image", boxes: list):
                 return  # too small to be an intentional box — ignore
 
             scale = total_scale()
-            disp_w = max(int(img.width * scale), 1)
-            disp_h = max(int(img.height * scale), 1)
+            disp_w = max(int(state['img'].width * scale), 1)
+            disp_h = max(int(state['img'].height * scale), 1)
             x0 = min(max(x0, 0), disp_w)
             x1 = min(max(x1, 0), disp_w)
             y0 = min(max(y0, 0), disp_h)
@@ -531,20 +598,14 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
             print("⚠️ Calibrazione già in corso altrove: riprova più tardi.")
             return
         try:
-            root = Tk()
-            root.withdraw()
-            pdf_path = askopenfilename(title="Seleziona un PDF da calibrare", filetypes=[("PDF", "*.pdf")])
-            root.destroy()
-            if not pdf_path:
+            pdf_paths = _list_watched_pdfs(cartella)
+            if not pdf_paths:
+                print("⚠️ Nessun PDF trovato nella cartella monitorata.")
                 return
-            immagini = convert_from_path(
-                pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1,
-                poppler_path=_get_poppler_path(),
-            )
             boxes_seed = list(ocr_cfg['boxes'])
             while len(boxes_seed) < MIN_BOXES:
                 boxes_seed.append(_default_box(len(boxes_seed)))
-            nuovi_box = _calibra_box(immagini[0], boxes_seed)
+            nuovi_box = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg['dpi'])
             if nuovi_box:
                 ocr_cfg['boxes'] = nuovi_box
                 _save_boxes_to_config(ocr_cfg['boxes'])
@@ -570,11 +631,7 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
 def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
     """Esegue OCR e rinomina il PDF con il testo estratto."""
     try:
-        immagini = convert_from_path(
-            pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1,
-            poppler_path=_get_poppler_path(),
-        )
-        img = immagini[0]
+        img = _render_pdf_page(pdf_path, ocr_cfg['dpi'])
 
         serve_calibrazione = len(ocr_cfg['boxes']) < MIN_BOXES
         if ocr_cfg['show_rects'] or serve_calibrazione:
@@ -589,7 +646,8 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     boxes_seed = list(ocr_cfg['boxes'])
                     while len(boxes_seed) < MIN_BOXES:
                         boxes_seed.append(_default_box(len(boxes_seed)))
-                    nuovi_box = _calibra_box(img, boxes_seed)
+                    pdf_paths = _list_watched_pdfs(os.path.dirname(pdf_path))
+                    nuovi_box = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg['dpi'])
                     if nuovi_box:
                         ocr_cfg['boxes'] = nuovi_box
                         _save_boxes_to_config(ocr_cfg['boxes'])

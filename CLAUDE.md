@@ -79,13 +79,18 @@ non-empty cleaned strings are joined with a single space into the new filename, 
 ... appended on collision. Before OCR, `_rinomina_pdf` calibrates the crop boxes via `_calibra_box`
 whenever fewer than `MIN_BOXES` are configured (first PDF ever processed — the calibrator is
 mandatory then, and cancelling skips that file rather than cropping garbage) or whenever
-`show_rects` is `True` in `config.ini` (opt-in recalibration). `_calibra_box` opens a Tk window with
-the rendered page on a scrollable/zoomable `Canvas` (mouse wheel or +/− buttons, scaled around a
-`base_scale` fit-to-screen and clamped by `MAX_ZOOM`/`MAX_DIM`) with colored, numbered selector
-buttons (one per box, colors match the drawn rectangles) picking which box the next drag updates,
-plus `+ Box`/`− Box` buttons (disabled at 5/2 respectively) to change the box count; saving persists
-the new box list to `config.ini` via `_save_boxes_to_config` and applies it immediately to `ocr_cfg`
-for the file being processed.
+`show_rects` is `True` in `config.ini` (opt-in recalibration). `_calibra_box(pdf_paths, initial_path,
+boxes, dpi)` opens a Tk window with the rendered page on a scrollable/zoomable `Canvas` (mouse wheel
+or +/− buttons, scaled around a `base_scale` fit-to-screen and clamped by `MAX_ZOOM`/`MAX_DIM`),
+plus a sidebar `Listbox` of every PDF in the watched folder (`_list_watched_pdfs`, sorted
+alphabetically, `initial_path` preselected) so box placement can be checked live against multiple
+real documents before saving — each page renders lazily via `_render_pdf_page` on first selection
+and is cached for the rest of the session, and box coordinates are never remapped on switch (same
+`dpi` for every render, so a misaligned box on another document is visible rather than hidden).
+Colored, numbered selector buttons (one per box, colors match the drawn rectangles) pick which box
+the next drag updates, plus `+ Box`/`− Box` buttons (disabled at 5/2 respectively) to change the box
+count; saving persists the new box list to `config.ini` via `_save_boxes_to_config` and applies it
+immediately to `ocr_cfg` for the file being processed.
 
 **Watching**: `CMRHandler` (a `watchdog` `FileSystemEventHandler`) reacts to created/moved/modified
 events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to stop
@@ -96,8 +101,10 @@ starting the observer loop.
 
 **Background mode UI**: when frozen and running in background mode, a system tray icon
 (`pystray`, guarded the same way as the `tkinter` import — missing `pystray` just means no tray,
-not a crash) offers "Apri log", "Apri cartella monitorata", "Ricalibra box" (opens a file picker
-and runs the same `_calibra_box` calibrator against a chosen PDF), and "Esci". This is the only way
+not a crash) offers "Apri log", "Apri cartella monitorata", "Ricalibra box" (scans the watched
+folder for PDFs via `_list_watched_pdfs`, the same way mandatory first-run calibration does, and
+opens the same `_calibra_box` calibrator against that list — no file picker; an empty folder just
+prints a warning and does nothing), and "Esci". This is the only way
 to exit a frozen+windowed instance, since it has no console/Ctrl+C available. Log output in
 background mode goes through `_RotatingWriter`, which caps `cmr-renamer.log` at ~1MB with one
 backup (`cmr-renamer.log.1`) instead of growing unbounded.
