@@ -889,6 +889,7 @@ def run() -> int:
     # setup prompt and only takes effect if a user hand-edits config.ini.
     ocr_cfg = {
         'boxes': _load_boxes_from_config(cfg['OCR']),
+        'anchor': _load_anchor_from_config(cfg['OCR']),
         'show_rects': cfg['OCR'].getboolean('show_rects', fallback=False),
         'lang': cfg['OCR']['lang'],
         'dpi': int(cfg['OCR']['dpi']),
