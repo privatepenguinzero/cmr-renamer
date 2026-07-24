@@ -374,12 +374,21 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
         'boxes': list(boxes),
         'active': 0, 'start': None, 'drag_id': None, 'result': None,
         'zoom': 1.0, 'photo': None, 'img': None, 'current_path': initial_path,
+        'reference_anchor': None, 'preview_shift': (0, 0),
     }
     drawn_ids: dict = {}
     select_buttons: dict = {}
 
+    def update_preview_shift():
+        current = _detect_content_anchor(state['img'])
+        state['preview_shift'] = _compute_anchor_shift(current, state['reference_anchor'], dpi)
+
     try:
         state['img'] = get_image(initial_path)
+        state['reference_anchor'] = _detect_content_anchor(state['img'])
+        # initial_path IS the reference for this session, so its own shift is always (0, 0);
+        # update_preview_shift() only needs to run again once a *different* file is selected
+        # (see on_file_select below) — no need to call it here too.
         root = Tk()
         root.title("CMR Renamer - Calibrazione box OCR")
 
@@ -447,7 +456,9 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
 
         def draw_box(index):
             scale = total_scale()
-            x1, y1, x2, y2 = [c * scale for c in state['boxes'][index]]
+            dx, dy = state['preview_shift']
+            bx1, by1, bx2, by2 = state['boxes'][index]
+            x1, y1, x2, y2 = [(bx1 + dx) * scale, (by1 + dy) * scale, (bx2 + dx) * scale, (by2 + dy) * scale]
             if index in drawn_ids:
                 canvas.delete(drawn_ids[index])
             drawn_ids[index] = canvas.create_rectangle(
@@ -566,6 +577,7 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
                 return
             state['img'] = new_img
             state['current_path'] = path
+            update_preview_shift()
             render()
 
         file_listbox.bind("<<ListboxSelect>>", on_file_select)
@@ -611,8 +623,12 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
             x0, x1 = sorted((x0, x1))
             y0, y1 = sorted((y0, y1))
 
+            dx, dy = state['preview_shift']
             index = state['active']
-            state['boxes'][index] = (int(x0 / scale), int(y0 / scale), int(x1 / scale), int(y1 / scale))
+            state['boxes'][index] = (
+                int(x0 / scale) - dx, int(y0 / scale) - dy,
+                int(x1 / scale) - dx, int(y1 / scale) - dy,
+            )
             draw_box(index)
 
         canvas.bind("<ButtonPress-1>", on_press)
@@ -646,13 +662,13 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
 
     def _open_log(icon, item):
         try:
-            os.startfile(log_path)
+            os.startfile(os.path.normpath(log_path))
         except Exception as e:
             print(f"⚠️ Impossibile aprire il log: {e}")
 
     def _open_folder(icon, item):
         try:
-            os.startfile(cartella)
+            os.startfile(os.path.normpath(cartella))
         except Exception as e:
             print(f"⚠️ Impossibile aprire la cartella: {e}")
 
@@ -695,6 +711,22 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
 MAX_ANCHOR_SHIFT_MM = 15  # oltre questa soglia lo spostamento rilevato è considerato inaffidabile
 
 
+def _compute_anchor_shift(current: "tuple[int, int] | None", reference: "tuple[int, int] | None", dpi: int) -> "tuple[int, int]":
+    """Calcola lo spostamento (dx, dy) tra due ancore di contenuto.
+
+    Ritorna (0, 0) se manca un'ancora, o se lo spostamento supera la soglia plausibile
+    (MAX_ANCHOR_SHIFT_MM convertita in pixel in base al dpi).
+    """
+    if reference is None or current is None:
+        return (0, 0)
+    dx = current[0] - reference[0]
+    dy = current[1] - reference[1]
+    max_shift_px = dpi * MAX_ANCHOR_SHIFT_MM / 25.4
+    if abs(dx) > max_shift_px or abs(dy) > max_shift_px:
+        return (0, 0)
+    return (dx, dy)
+
+
 def _resolve_crop_boxes(img: "Image.Image", ocr_cfg: dict) -> list:
     """Ritorna i box da ritagliare, corretti per la deriva di scansione quando possibile.
 
@@ -712,11 +744,11 @@ def _resolve_crop_boxes(img: "Image.Image", ocr_cfg: dict) -> list:
         print("⚠️ Ancora di contenuto non rilevabile: uso i box calibrati senza correzione deriva.")
         return boxes
 
-    dx = current[0] - reference[0]
-    dy = current[1] - reference[1]
-    max_shift_px = ocr_cfg['dpi'] * MAX_ANCHOR_SHIFT_MM / 25.4
-    if abs(dx) > max_shift_px or abs(dy) > max_shift_px:
-        print(f"⚠️ Spostamento rilevato ({dx}, {dy}px) oltre la soglia plausibile: uso i box calibrati senza correzione deriva.")
+    raw_dx = current[0] - reference[0]
+    raw_dy = current[1] - reference[1]
+    dx, dy = _compute_anchor_shift(current, reference, ocr_cfg['dpi'])
+    if (dx, dy) != (raw_dx, raw_dy):
+        print(f"⚠️ Spostamento rilevato ({raw_dx}, {raw_dy}px) oltre la soglia plausibile: uso i box calibrati senza correzione deriva.")
         return boxes
 
     return [(x1 + dx, y1 + dy, x2 + dx, y2 + dy) for (x1, y1, x2, y2) in boxes]
@@ -842,8 +874,9 @@ def run() -> int:
     config_exists = os.path.exists(config_path)
 
     # ── Background vs interactive mode ─────────────────────
-    if _is_frozen() and not config_exists:
-        # Frozen + no config → allocate console for setup
+    if _is_frozen() and not config_exists and not TKINTER_AVAILABLE:
+        # Frozen + no config + no tkinter → allocate a console so the text
+        # prompts are visible, since there's no GUI form to fall back to.
         _alloc_console()
         print("\n=== CMR Renamer - Configurazione Iniziale ===\n")
         try:
@@ -857,6 +890,18 @@ def run() -> int:
             _free_console()
             # After setup, continue in background mode
             _setup_file_logging(config_dir)
+    elif _is_frozen() and not config_exists:
+        # Frozen + no config + tkinter available → the GUI form needs no console.
+        # File logging must be set up BEFORE load_or_create_config runs: a
+        # --windowed build with no console allocated has sys.stdout/stderr set to
+        # None, and load_or_create_config prints status messages — those would
+        # raise AttributeError without somewhere to write to first.
+        _setup_file_logging(config_dir)
+        try:
+            cfg = load_or_create_config(config_path=config_path)
+        except Exception as e:
+            print(f"❌ Errore durante la configurazione: {e}")
+            return 1 # Indicate error
     elif _is_frozen() and config_exists:
         # Frozen + config exists → background mode (no console)
         _setup_file_logging(config_dir)
