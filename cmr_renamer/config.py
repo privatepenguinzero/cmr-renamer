@@ -8,7 +8,7 @@ import sys
 import configparser
 
 try:
-    from tkinter import Tk
+    from tkinter import Tk, Frame, Label, Entry, Button, Checkbutton, BooleanVar, StringVar
     from tkinter.filedialog import askdirectory
     TKINTER_AVAILABLE = True
 except ImportError:
@@ -61,6 +61,125 @@ def _prompt_for_folder():
             print(f"Errore apertura finestra: {e}. Input manuale.")
 
     return _prompt_console("Inserisci il percorso completo della cartella da monitorare")
+
+
+def _prompt_with_gui() -> "dict | None":
+    """Mostra un'unica finestra Tkinter con tutti i campi di configurazione iniziale.
+
+    Ritorna un dict con le stesse chiavi che load_or_create_config scrive in config.ini (tutti
+    valori stringa), oppure None se tkinter non è disponibile o la finestra viene chiusa senza
+    salvare — in quel caso il chiamante ricade sui prompt a console.
+    """
+    if not TKINTER_AVAILABLE:
+        return None
+
+    result = {'value': None}
+
+    try:
+        root = Tk()
+        root.title("CMR Renamer - Configurazione Iniziale")
+
+        folder_var = StringVar(value="")
+        prefix_var = StringVar(value="DOC")
+        delay_var = StringVar(value="3")
+        dpi_var = StringVar(value="300")
+        max_length_var = StringVar(value="60")
+        extra_lang_var = StringVar(value="")
+        eng_var = BooleanVar(value=True)
+        ita_var = BooleanVar(value=False)
+        deu_var = BooleanVar(value=False)
+        remove_zeros_var = BooleanVar(value=True)
+
+        def browse_folder():
+            chosen = askdirectory(title="Seleziona la cartella da monitorare")
+            if chosen:
+                folder_var.set(chosen)
+
+        row = 0
+        Label(root, text="Cartella da monitorare:").grid(row=row, column=0, sticky="w", padx=8, pady=4)
+        Entry(root, textvariable=folder_var, width=40).grid(row=row, column=1, padx=8, pady=4)
+        Button(root, text="Sfoglia...", command=browse_folder).grid(row=row, column=2, padx=8, pady=4)
+        row += 1
+
+        Label(root, text="Prefisso file (es. DOC):").grid(row=row, column=0, sticky="w", padx=8, pady=4)
+        Entry(root, textvariable=prefix_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
+        row += 1
+
+        Label(root, text="Delay tra rilevamenti (secondi):").grid(row=row, column=0, sticky="w", padx=8, pady=4)
+        Entry(root, textvariable=delay_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
+        row += 1
+
+        Label(root, text="Lingua OCR:").grid(row=row, column=0, sticky="nw", padx=8, pady=4)
+        lang_frame = Frame(root)
+        lang_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
+        Checkbutton(lang_frame, text="eng", variable=eng_var).pack(side="left")
+        Checkbutton(lang_frame, text="ita", variable=ita_var).pack(side="left")
+        Checkbutton(lang_frame, text="deu", variable=deu_var).pack(side="left")
+        row += 1
+
+        Label(root, text="Altre lingue (es. fra, separate da +):").grid(row=row, column=0, sticky="w", padx=8, pady=4)
+        Entry(root, textvariable=extra_lang_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
+        row += 1
+
+        Label(root, text="DPI per conversione PDF:").grid(row=row, column=0, sticky="w", padx=8, pady=4)
+        Entry(root, textvariable=dpi_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
+        row += 1
+
+        Label(root, text="Lunghezza massima per parte del nome file:").grid(row=row, column=0, sticky="w", padx=8, pady=4)
+        Entry(root, textvariable=max_length_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
+        row += 1
+
+        Checkbutton(root, text="Rimuovi zeri iniziali dai numeri", variable=remove_zeros_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8, pady=4
+        )
+        row += 1
+
+        error_label = Label(root, text="", fg="red")
+        error_label.grid(row=row, column=0, columnspan=3, sticky="w", padx=8, pady=4)
+        row += 1
+
+        def on_confirm():
+            delay = _parse_positive_int(delay_var.get())
+            dpi = _parse_positive_int(dpi_var.get())
+            max_length = _parse_positive_int(max_length_var.get())
+            lang = _build_lang_string(eng_var.get(), ita_var.get(), deu_var.get(), extra_lang_var.get())
+
+            if delay is None:
+                error_label.config(text="Il delay tra rilevamenti deve essere un numero intero positivo.")
+                return
+            if dpi is None:
+                error_label.config(text="Il DPI deve essere un numero intero positivo.")
+                return
+            if max_length is None:
+                error_label.config(text="La lunghezza massima del nome deve essere un numero intero positivo.")
+                return
+            if not lang:
+                error_label.config(text="Seleziona almeno una lingua OCR.")
+                return
+
+            result['value'] = {
+                'folder': folder_var.get(),
+                'prefix': prefix_var.get() or "DOC",
+                'delay_riavvio': str(delay),
+                'lang': lang,
+                'dpi': str(dpi),
+                'max_length': str(max_length),
+                'remove_leading_zeros': str(remove_zeros_var.get()),
+            }
+            root.destroy()
+
+        def on_close():
+            result['value'] = None
+            root.destroy()
+
+        Button(root, text="Conferma", command=on_confirm).grid(row=row, column=0, columnspan=3, pady=8)
+        root.protocol("WM_DELETE_WINDOW", on_close)
+
+        root.mainloop()
+        return result['value']
+    except Exception as e:
+        print(f"⚠️ Errore nella finestra di configurazione: {e}. Uso i prompt da console.")
+        return None
 
 
 def load_or_create_config(config_path: str = None) -> "configparser.ConfigParser":
