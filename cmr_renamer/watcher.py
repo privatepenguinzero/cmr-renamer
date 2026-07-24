@@ -653,7 +653,8 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     boxes_seed = list(ocr_cfg['boxes'])
                     while len(boxes_seed) < MIN_BOXES:
                         boxes_seed.append(_default_box(len(boxes_seed)))
-                    nuovi_box = _calibra_box(img, boxes_seed)
+                    pdf_paths = _list_watched_pdfs(os.path.dirname(pdf_path))
+                    nuovi_box = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg['dpi'])
                     if nuovi_box:
                         ocr_cfg['boxes'] = nuovi_box
                         _save_boxes_to_config(ocr_cfg['boxes'])
