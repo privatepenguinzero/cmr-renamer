@@ -695,6 +695,22 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
 MAX_ANCHOR_SHIFT_MM = 15  # oltre questa soglia lo spostamento rilevato è considerato inaffidabile
 
 
+def _compute_anchor_shift(current: "tuple[int, int] | None", reference: "tuple[int, int] | None", dpi: int) -> "tuple[int, int]":
+    """Calcola lo spostamento (dx, dy) tra due ancore di contenuto.
+
+    Ritorna (0, 0) se manca un'ancora, o se lo spostamento supera la soglia plausibile
+    (MAX_ANCHOR_SHIFT_MM convertita in pixel in base al dpi).
+    """
+    if reference is None or current is None:
+        return (0, 0)
+    dx = current[0] - reference[0]
+    dy = current[1] - reference[1]
+    max_shift_px = dpi * MAX_ANCHOR_SHIFT_MM / 25.4
+    if abs(dx) > max_shift_px or abs(dy) > max_shift_px:
+        return (0, 0)
+    return (dx, dy)
+
+
 def _resolve_crop_boxes(img: "Image.Image", ocr_cfg: dict) -> list:
     """Ritorna i box da ritagliare, corretti per la deriva di scansione quando possibile.
 
@@ -712,11 +728,11 @@ def _resolve_crop_boxes(img: "Image.Image", ocr_cfg: dict) -> list:
         print("⚠️ Ancora di contenuto non rilevabile: uso i box calibrati senza correzione deriva.")
         return boxes
 
-    dx = current[0] - reference[0]
-    dy = current[1] - reference[1]
-    max_shift_px = ocr_cfg['dpi'] * MAX_ANCHOR_SHIFT_MM / 25.4
-    if abs(dx) > max_shift_px or abs(dy) > max_shift_px:
-        print(f"⚠️ Spostamento rilevato ({dx}, {dy}px) oltre la soglia plausibile: uso i box calibrati senza correzione deriva.")
+    raw_dx = current[0] - reference[0]
+    raw_dy = current[1] - reference[1]
+    dx, dy = _compute_anchor_shift(current, reference, ocr_cfg['dpi'])
+    if (dx, dy) != (raw_dx, raw_dy):
+        print(f"⚠️ Spostamento rilevato ({raw_dx}, {raw_dy}px) oltre la soglia plausibile: uso i box calibrati senza correzione deriva.")
         return boxes
 
     return [(x1 + dx, y1 + dy, x2 + dx, y2 + dy) for (x1, y1, x2, y2) in boxes]
