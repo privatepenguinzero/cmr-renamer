@@ -267,6 +267,14 @@ def _box_label(index: int) -> str:
     return f"box {index + 1}"
 
 
+def _list_watched_pdfs(folder: str) -> list:
+    """Elenca i percorsi assoluti dei PDF nella cartella, ordinati per nome file."""
+    if not os.path.isdir(folder):
+        return []
+    nomi = sorted(f for f in os.listdir(folder) if f.endswith('.pdf'))
+    return [os.path.join(folder, f) for f in nomi]
+
+
 def _calibra_box(img: "Image.Image", boxes: list):
     """Mostra la pagina e permette di ridisegnare 2-5 box col mouse.
 
