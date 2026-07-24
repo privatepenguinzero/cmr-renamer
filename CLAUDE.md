@@ -46,16 +46,26 @@ top-level behavior in `watcher.run()` so all three entry points stay in sync aut
 event handler (`CMRHandler`) all live here. Frozen-vs-source and interactive-vs-background execution
 are all branched inside `run()`:
 - Not frozen (running from source): behaves like a normal console script.
-- Frozen + no `config.ini`: allocates a Windows console (`_alloc_console`/`_free_console`, via
-  `ctypes.windll.kernel32`) so the interactive setup prompts are visible, then frees it and switches
-  to file logging (`_setup_file_logging` redirects `sys.stdout`/`stderr` to `cmr-renamer.log`) for
-  normal background operation.
+- Frozen + no `config.ini`, `tkinter` unavailable: allocates a Windows console
+  (`_alloc_console`/`_free_console`, via `ctypes.windll.kernel32`) so the interactive console
+  setup prompts are visible, then frees it and switches to file logging (`_setup_file_logging`
+  redirects `sys.stdout`/`stderr` to `cmr-renamer.log`) for normal background operation.
+- Frozen + no `config.ini`, `tkinter` available: no console at all — `_setup_file_logging` runs
+  first (a `--windowed` build with no console has `sys.stdout`/`stderr` as `None`, so anything
+  printed before logging is set up would crash), then `load_or_create_config` shows the GUI setup
+  form directly.
 - Frozen + config exists: goes straight to background/file-logging mode — no console at all, since
   the exe is built with `--windowed`.
 
 **Config lives next to the executable (or CWD when running from source)**, in `config.ini`, and is
-created interactively on first run by `config.py` (`load_or_create_config`). It prefers a tkinter
-folder picker for the watched directory, falling back to console input if tkinter/GUI is unavailable.
+created interactively on first run by `config.py` (`load_or_create_config`). It prefers a single
+Tkinter form (`_prompt_with_gui`) covering every setting — folder (with a "Sfoglia..." button
+reusing the same `askdirectory` picker), prefix, delay, OCR language (checkboxes for the bundled
+`eng`/`ita`/`deu` plus a free-text field for extra codes, joined with `+` via `_build_lang_string`),
+dpi, max filename length, and the leading-zeros checkbox — validating delay/dpi/max_length as
+positive integers (`_parse_positive_int`) and requiring at least one language before saving.
+Falls back to the original per-field console prompts if `tkinter` is unavailable or the form is
+closed without saving.
 Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1..box5 crop coordinates
 for 2-5 boxes, anchor_x/anchor_y content-anchor reference, show_rects debug flag, lang, dpi),
 `[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
@@ -87,8 +97,12 @@ or +/− buttons, scaled around a `base_scale` fit-to-screen and clamped by `MAX
 plus a sidebar `Listbox` of every PDF in the watched folder (`_list_watched_pdfs`, sorted
 alphabetically, `initial_path` preselected) so box placement can be checked live against multiple
 real documents before saving — each page renders lazily via `_render_pdf_page` on first selection
-and is cached for the rest of the session, and box coordinates are never remapped on switch (same
-`dpi` for every render, so a misaligned box on another document is visible rather than hidden).
+and is cached for the rest of the session. The stored box coordinates themselves stay fixed to
+`initial_path` as the session's reference frame, but what's *drawn* on a non-reference file is
+shifted by `_compute_anchor_shift` (the same drift-correction math `_resolve_crop_boxes` uses
+during real processing) so the sidebar preview shows where the boxes would actually land after
+correction — dragging on a non-reference file un-shifts the dropped position before storing it, so
+the saved coordinate stays correct regardless of which file was on screen while dragging.
 Colored, numbered selector buttons (one per box, colors match the drawn rectangles) pick which box
 the next drag updates, plus `+ Box`/`− Box` buttons (disabled at 5/2 respectively) to change the box
 count; saving computes a *content anchor* via `_detect_content_anchor` (where the page's content
