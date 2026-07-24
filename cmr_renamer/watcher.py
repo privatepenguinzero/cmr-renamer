@@ -202,6 +202,51 @@ def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
     return contrasted.point(lambda p: 255 if p > 128 else 0)
 
 
+_ANCHOR_DARK_THRESHOLD = 128  # stessa soglia di _preprocess_for_ocr
+_ANCHOR_MIN_DARK_FRACTION = 0.03  # frazione minima di pixel scuri per considerare una riga/colonna "contenuto"
+_ANCHOR_MIN_RUN = 4  # posizioni consecutive richieste, per ignorare rumore isolato (graffette, polvere)
+
+
+def _content_profile(binaria: "Image.Image", axis_size: int, vertical: bool) -> list:
+    """Frazione di pixel scuri per riga (vertical=True) o per colonna, via resize con filtro BOX."""
+    if vertical:
+        small = binaria.resize((1, axis_size), Image.BOX)
+    else:
+        small = binaria.resize((axis_size, 1), Image.BOX)
+    return [(255 - p) / 255 for p in small.getdata()]
+
+
+def _find_content_start(profile: list) -> "int | None":
+    """Primo indice con densità di scuro sufficiente, sostenuta per _ANCHOR_MIN_RUN posizioni."""
+    run = 0
+    for i, frac in enumerate(profile):
+        if frac >= _ANCHOR_MIN_DARK_FRACTION:
+            run += 1
+            if run >= _ANCHOR_MIN_RUN:
+                return i - _ANCHOR_MIN_RUN + 1
+        else:
+            run = 0
+    return None
+
+
+def _detect_content_anchor(img: "Image.Image") -> "tuple[int, int] | None":
+    """Rileva dove inizia il contenuto (non bianco) dall'alto e da sinistra della pagina.
+
+    Ritorna (anchor_x, anchor_y) in pixel, o None se non trova un bordo di contenuto sostenuto
+    (pagina quasi bianca).
+    """
+    gray = img.convert('L')
+    binaria = gray.point(lambda p: 0 if p < _ANCHOR_DARK_THRESHOLD else 255)
+    w, h = binaria.size
+
+    anchor_y = _find_content_start(_content_profile(binaria, h, vertical=True))
+    anchor_x = _find_content_start(_content_profile(binaria, w, vertical=False))
+
+    if anchor_x is None or anchor_y is None:
+        return None
+    return (anchor_x, anchor_y)
+
+
 def _file_pronto(path: str, timeout: int = 5) -> bool:
     """Aspetta che il file sia finito di scrivere dalla fotocopiatrice."""
     try:
@@ -226,8 +271,8 @@ MAX_BOXES = 5
 _calibration_lock = threading.Lock()
 
 
-def _save_boxes_to_config(boxes: list) -> None:
-    """Salva le coordinate di tutti i box (2-5) nel config.ini esistente."""
+def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None") -> None:
+    """Salva le coordinate di tutti i box (2-5) e l'ancora di contenuto nel config.ini esistente."""
     config_path = os.path.join(_get_config_dir(), 'config.ini')
     config = configparser.ConfigParser()
     config.read(config_path)
@@ -239,6 +284,12 @@ def _save_boxes_to_config(boxes: list) -> None:
     # con più box (es. da 4 box a 3: box4 va eliminato, non lasciato stantio).
     for i in range(len(boxes) + 1, MAX_BOXES + 1):
         config['OCR'].pop(f'box{i}', None)
+    if anchor is not None:
+        config['OCR']['anchor_x'] = str(int(anchor[0]))
+        config['OCR']['anchor_y'] = str(int(anchor[1]))
+    else:
+        config['OCR'].pop('anchor_x', None)
+        config['OCR'].pop('anchor_y', None)
     with open(config_path, 'w') as f:
         config.write(f)
 
@@ -246,7 +297,7 @@ def _save_boxes_to_config(boxes: list) -> None:
 def _load_boxes_from_config(ocr_section) -> list:
     """Legge box1..box5 da una sezione [OCR] già caricata, in ordine.
 
-    Si ferma al primo box assente — sufficiente perché _save_boxes_to_config
+    Si ferma al primo box assente — sufficiente perché _save_calibration_to_config
     scrive sempre chiavi contigue a partire da box1.
     """
     boxes = []
@@ -256,6 +307,15 @@ def _load_boxes_from_config(ocr_section) -> list:
             break
         boxes.append(tuple(map(int, raw.split(','))))
     return boxes
+
+
+def _load_anchor_from_config(ocr_section) -> "tuple[int, int] | None":
+    """Legge anchor_x/anchor_y da una sezione [OCR] già caricata, se entrambi presenti."""
+    x = ocr_section.get('anchor_x')
+    y = ocr_section.get('anchor_y')
+    if x is None or y is None:
+        return None
+    return (int(x), int(y))
 
 
 BOX_COLORS = ["red", "blue", "green", "orange", "purple"]
@@ -290,7 +350,10 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
     per confrontare visivamente se i box calibrati si applicano bene a più documenti; il cambio file
     ridisegna solo l'immagine di sfondo, i box restano nelle stesse coordinate. `initial_path` è il
     file mostrato all'apertura (preselezionato in lista). `boxes` è una lista di partenza di 2-5
-    tuple (x1,y1,x2,y2). Ritorna la nuova lista di box se l'utente salva, altrimenti None.
+    tuple (x1,y1,x2,y2). Se l'utente salva, ritorna {'boxes': [...], 'anchor': (x,y) | None} —
+    l'ancora è rilevata sull'immagine visualizzata al momento del salvataggio (non necessariamente
+    quella di `initial_path`, se nel frattempo si è passati a un altro file dalla lista). Ritorna
+    None se l'utente annulla.
     """
     if not TKINTER_AVAILABLE:
         print("⚠️ tkinter non disponibile: calibrazione box saltata.")
@@ -560,7 +623,7 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
         btn_frame.pack(pady=8)
 
         def on_save():
-            state['result'] = list(state['boxes'])
+            state['result'] = {'boxes': list(state['boxes']), 'anchor': _detect_content_anchor(state['img'])}
             root.destroy()
 
         def on_cancel():
@@ -605,10 +668,11 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
             boxes_seed = list(ocr_cfg['boxes'])
             while len(boxes_seed) < MIN_BOXES:
                 boxes_seed.append(_default_box(len(boxes_seed)))
-            nuovi_box = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg['dpi'])
-            if nuovi_box:
-                ocr_cfg['boxes'] = nuovi_box
-                _save_boxes_to_config(ocr_cfg['boxes'])
+            risultato = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg['dpi'])
+            if risultato:
+                ocr_cfg['boxes'] = risultato['boxes']
+                ocr_cfg['anchor'] = risultato['anchor']
+                _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'])
                 print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
         except Exception as e:
             print(f"⚠️ Errore durante la ricalibrazione: {e}")
@@ -626,6 +690,36 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
         pystray.MenuItem("Esci", _exit),
     )
     return pystray.Icon("cmr-renamer", icon_image, "CMR Renamer", menu)
+
+
+MAX_ANCHOR_SHIFT_MM = 15  # oltre questa soglia lo spostamento rilevato è considerato inaffidabile
+
+
+def _resolve_crop_boxes(img: "Image.Image", ocr_cfg: dict) -> list:
+    """Ritorna i box da ritagliare, corretti per la deriva di scansione quando possibile.
+
+    Se non c'è un'ancora di riferimento salvata, se l'ancora non è rilevabile sulla pagina
+    corrente, o se lo spostamento rilevato supera la soglia plausibile, ritorna i box calibrati
+    senza modifiche — il file viene comunque elaborato, solo senza correzione.
+    """
+    boxes = ocr_cfg['boxes']
+    reference = ocr_cfg.get('anchor')
+    if reference is None:
+        return boxes
+
+    current = _detect_content_anchor(img)
+    if current is None:
+        print("⚠️ Ancora di contenuto non rilevabile: uso i box calibrati senza correzione deriva.")
+        return boxes
+
+    dx = current[0] - reference[0]
+    dy = current[1] - reference[1]
+    max_shift_px = ocr_cfg['dpi'] * MAX_ANCHOR_SHIFT_MM / 25.4
+    if abs(dx) > max_shift_px or abs(dy) > max_shift_px:
+        print(f"⚠️ Spostamento rilevato ({dx}, {dy}px) oltre la soglia plausibile: uso i box calibrati senza correzione deriva.")
+        return boxes
+
+    return [(x1 + dx, y1 + dy, x2 + dx, y2 + dy) for (x1, y1, x2, y2) in boxes]
 
 
 def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
@@ -647,10 +741,11 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     while len(boxes_seed) < MIN_BOXES:
                         boxes_seed.append(_default_box(len(boxes_seed)))
                     pdf_paths = _list_watched_pdfs(os.path.dirname(pdf_path))
-                    nuovi_box = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg['dpi'])
-                    if nuovi_box:
-                        ocr_cfg['boxes'] = nuovi_box
-                        _save_boxes_to_config(ocr_cfg['boxes'])
+                    risultato = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg['dpi'])
+                    if risultato:
+                        ocr_cfg['boxes'] = risultato['boxes']
+                        ocr_cfg['anchor'] = risultato['anchor']
+                        _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'])
                         print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
                     elif serve_calibrazione:
                         print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
@@ -659,7 +754,7 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     _calibration_lock.release()
 
         parti = []
-        for box in ocr_cfg['boxes']:
+        for box in _resolve_crop_boxes(img, ocr_cfg):
             crop = _preprocess_for_ocr(img.crop(box))
             testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'])
             pulito = _pulisci_nome(testo, name_cfg['max_length'], name_cfg['remove_leading_zeros'])
@@ -794,6 +889,7 @@ def run() -> int:
     # setup prompt and only takes effect if a user hand-edits config.ini.
     ocr_cfg = {
         'boxes': _load_boxes_from_config(cfg['OCR']),
+        'anchor': _load_anchor_from_config(cfg['OCR']),
         'show_rects': cfg['OCR'].getboolean('show_rects', fallback=False),
         'lang': cfg['OCR']['lang'],
         'dpi': int(cfg['OCR']['dpi']),

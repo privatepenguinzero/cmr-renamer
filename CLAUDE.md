@@ -57,17 +57,19 @@ are all branched inside `run()`:
 created interactively on first run by `config.py` (`load_or_create_config`). It prefers a tkinter
 folder picker for the watched directory, falling back to console input if tkinter/GUI is unavailable.
 Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1..box5 crop coordinates
-for 2-5 boxes, show_rects debug flag, lang, dpi), `[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
+for 2-5 boxes, anchor_x/anchor_y content-anchor reference, show_rects debug flag, lang, dpi),
+`[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
 reads and type-converts every value out of the raw `ConfigParser` into plain dicts (`ocr_cfg`,
 `name_cfg`) before using them — if you add a config key, update both `config.py`'s prompts and this
 parsing step. `prefix` is read with `cfg['Watcher'].get('prefix', 'DOC')` rather than a plain
 subscript, since it was added after the original hardcoded `DOC` filter and older `config.ini` files
 won't have the key — keep that fallback pattern for any new key added to an existing section.
-`box1`..`box5`/`show_rects` follow the same optional-key pattern deliberately: `config.py` never
-prompts for them (no generic crop coordinates make sense across documents), so `ocr_cfg['boxes']`
-is an empty list until the mouse calibrator (see below) fills it in and writes it back with
-`_save_boxes_to_config`; `show_rects` has no setup prompt at all and only takes effect if a user hand-edits
-`config.ini` to add it. The box count is configurable from 2 to 5 (`MIN_BOXES`/`MAX_BOXES` in
+`box1`..`box5`/`anchor_x`/`anchor_y`/`show_rects` follow the same optional-key pattern deliberately:
+`config.py` never prompts for them (no generic crop coordinates or content anchor make sense across
+documents), so `ocr_cfg['boxes']` is an empty list and `ocr_cfg['anchor']` is `None` until the mouse
+calibrator (see below) fills them in and writes them back with `_save_calibration_to_config`;
+`show_rects` has no setup prompt at all and only takes effect if a user hand-edits `config.ini` to
+add it. The box count is configurable from 2 to 5 (`MIN_BOXES`/`MAX_BOXES` in
 `watcher.py`) via `+`/`−` buttons in the calibrator itself, not a config prompt; existing
 `config.ini` files with only `box1`/`box2` load transparently as a 2-box config.
 
@@ -89,8 +91,18 @@ and is cached for the rest of the session, and box coordinates are never remappe
 `dpi` for every render, so a misaligned box on another document is visible rather than hidden).
 Colored, numbered selector buttons (one per box, colors match the drawn rectangles) pick which box
 the next drag updates, plus `+ Box`/`− Box` buttons (disabled at 5/2 respectively) to change the box
-count; saving persists the new box list to `config.ini` via `_save_boxes_to_config` and applies it
-immediately to `ocr_cfg` for the file being processed.
+count; saving computes a *content anchor* via `_detect_content_anchor` (where the page's content
+stops being white, from the top and from the left — a fast Pillow-only row/column darkness scan,
+no numpy/OpenCV) on whichever page is on screen at that moment, and persists both the box list and
+that anchor to `config.ini` via `_save_calibration_to_config`, applying them immediately to
+`ocr_cfg` for the file being processed. From then on, every file `_rinomina_pdf` processes runs
+`_resolve_crop_boxes`, which re-detects the anchor on that page and shifts all boxes by the
+difference from the saved reference before cropping — compensating for a scanner/copier feeding the
+page a few millimeters off from where it was during calibration. If the anchor can't be detected
+(near-blank page) or the shift looks implausible (beyond `MAX_ANCHOR_SHIFT_MM`), it falls back to
+the uncorrected calibrated boxes and logs a warning rather than blocking the file. `config.ini`
+without `anchor_x`/`anchor_y` (calibrated before this existed) simply skips correction — same
+optional-key pattern as `box1..5`/`show_rects`.
 
 **Watching**: `CMRHandler` (a `watchdog` `FileSystemEventHandler`) reacts to created/moved/modified
 events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to stop
