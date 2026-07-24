@@ -874,8 +874,9 @@ def run() -> int:
     config_exists = os.path.exists(config_path)
 
     # ── Background vs interactive mode ─────────────────────
-    if _is_frozen() and not config_exists:
-        # Frozen + no config → allocate console for setup
+    if _is_frozen() and not config_exists and not TKINTER_AVAILABLE:
+        # Frozen + no config + no tkinter → allocate a console so the text
+        # prompts are visible, since there's no GUI form to fall back to.
         _alloc_console()
         print("\n=== CMR Renamer - Configurazione Iniziale ===\n")
         try:
@@ -889,6 +890,18 @@ def run() -> int:
             _free_console()
             # After setup, continue in background mode
             _setup_file_logging(config_dir)
+    elif _is_frozen() and not config_exists:
+        # Frozen + no config + tkinter available → the GUI form needs no console.
+        # File logging must be set up BEFORE load_or_create_config runs: a
+        # --windowed build with no console allocated has sys.stdout/stderr set to
+        # None, and load_or_create_config prints status messages — those would
+        # raise AttributeError without somewhere to write to first.
+        _setup_file_logging(config_dir)
+        try:
+            cfg = load_or_create_config(config_path=config_path)
+        except Exception as e:
+            print(f"❌ Errore durante la configurazione: {e}")
+            return 1 # Indicate error
     elif _is_frozen() and config_exists:
         # Frozen + config exists → background mode (no console)
         _setup_file_logging(config_dir)
