@@ -297,7 +297,7 @@ def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None") -
 def _load_boxes_from_config(ocr_section) -> list:
     """Legge box1..box5 da una sezione [OCR] già caricata, in ordine.
 
-    Si ferma al primo box assente — sufficiente perché _save_boxes_to_config
+    Si ferma al primo box assente — sufficiente perché _save_calibration_to_config
     scrive sempre chiavi contigue a partire da box1.
     """
     boxes = []
@@ -668,10 +668,11 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
             boxes_seed = list(ocr_cfg['boxes'])
             while len(boxes_seed) < MIN_BOXES:
                 boxes_seed.append(_default_box(len(boxes_seed)))
-            nuovi_box = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg['dpi'])
-            if nuovi_box:
-                ocr_cfg['boxes'] = nuovi_box
-                _save_boxes_to_config(ocr_cfg['boxes'])
+            risultato = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg['dpi'])
+            if risultato:
+                ocr_cfg['boxes'] = risultato['boxes']
+                ocr_cfg['anchor'] = risultato['anchor']
+                _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'])
                 print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
         except Exception as e:
             print(f"⚠️ Errore durante la ricalibrazione: {e}")
@@ -710,10 +711,11 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     while len(boxes_seed) < MIN_BOXES:
                         boxes_seed.append(_default_box(len(boxes_seed)))
                     pdf_paths = _list_watched_pdfs(os.path.dirname(pdf_path))
-                    nuovi_box = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg['dpi'])
-                    if nuovi_box:
-                        ocr_cfg['boxes'] = nuovi_box
-                        _save_boxes_to_config(ocr_cfg['boxes'])
+                    risultato = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg['dpi'])
+                    if risultato:
+                        ocr_cfg['boxes'] = risultato['boxes']
+                        ocr_cfg['anchor'] = risultato['anchor']
+                        _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'])
                         print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
                     elif serve_calibrazione:
                         print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
