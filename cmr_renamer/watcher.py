@@ -25,7 +25,6 @@ from .config import load_or_create_config
 
 try:
     from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox
-    from tkinter.filedialog import askopenfilename
     from PIL import ImageTk
     TKINTER_AVAILABLE = True
 except ImportError:
@@ -599,20 +598,14 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
             print("⚠️ Calibrazione già in corso altrove: riprova più tardi.")
             return
         try:
-            root = Tk()
-            root.withdraw()
-            pdf_path = askopenfilename(title="Seleziona un PDF da calibrare", filetypes=[("PDF", "*.pdf")])
-            root.destroy()
-            if not pdf_path:
+            pdf_paths = _list_watched_pdfs(cartella)
+            if not pdf_paths:
+                print("⚠️ Nessun PDF trovato nella cartella monitorata.")
                 return
-            immagini = convert_from_path(
-                pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1,
-                poppler_path=_get_poppler_path(),
-            )
             boxes_seed = list(ocr_cfg['boxes'])
             while len(boxes_seed) < MIN_BOXES:
                 boxes_seed.append(_default_box(len(boxes_seed)))
-            nuovi_box = _calibra_box(immagini[0], boxes_seed)
+            nuovi_box = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg['dpi'])
             if nuovi_box:
                 ocr_cfg['boxes'] = nuovi_box
                 _save_boxes_to_config(ocr_cfg['boxes'])
