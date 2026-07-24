@@ -350,7 +350,10 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
     per confrontare visivamente se i box calibrati si applicano bene a più documenti; il cambio file
     ridisegna solo l'immagine di sfondo, i box restano nelle stesse coordinate. `initial_path` è il
     file mostrato all'apertura (preselezionato in lista). `boxes` è una lista di partenza di 2-5
-    tuple (x1,y1,x2,y2). Ritorna la nuova lista di box se l'utente salva, altrimenti None.
+    tuple (x1,y1,x2,y2). Se l'utente salva, ritorna {'boxes': [...], 'anchor': (x,y) | None} —
+    l'ancora è rilevata sull'immagine visualizzata al momento del salvataggio (non necessariamente
+    quella di `initial_path`, se nel frattempo si è passati a un altro file dalla lista). Ritorna
+    None se l'utente annulla.
     """
     if not TKINTER_AVAILABLE:
         print("⚠️ tkinter non disponibile: calibrazione box saltata.")
@@ -620,7 +623,7 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
         btn_frame.pack(pady=8)
 
         def on_save():
-            state['result'] = list(state['boxes'])
+            state['result'] = {'boxes': list(state['boxes']), 'anchor': _detect_content_anchor(state['img'])}
             root.destroy()
 
         def on_cancel():
