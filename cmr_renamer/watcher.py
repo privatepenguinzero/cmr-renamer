@@ -271,8 +271,8 @@ MAX_BOXES = 5
 _calibration_lock = threading.Lock()
 
 
-def _save_boxes_to_config(boxes: list) -> None:
-    """Salva le coordinate di tutti i box (2-5) nel config.ini esistente."""
+def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None") -> None:
+    """Salva le coordinate di tutti i box (2-5) e l'ancora di contenuto nel config.ini esistente."""
     config_path = os.path.join(_get_config_dir(), 'config.ini')
     config = configparser.ConfigParser()
     config.read(config_path)
@@ -284,6 +284,12 @@ def _save_boxes_to_config(boxes: list) -> None:
     # con più box (es. da 4 box a 3: box4 va eliminato, non lasciato stantio).
     for i in range(len(boxes) + 1, MAX_BOXES + 1):
         config['OCR'].pop(f'box{i}', None)
+    if anchor is not None:
+        config['OCR']['anchor_x'] = str(int(anchor[0]))
+        config['OCR']['anchor_y'] = str(int(anchor[1]))
+    else:
+        config['OCR'].pop('anchor_x', None)
+        config['OCR'].pop('anchor_y', None)
     with open(config_path, 'w') as f:
         config.write(f)
 
@@ -301,6 +307,15 @@ def _load_boxes_from_config(ocr_section) -> list:
             break
         boxes.append(tuple(map(int, raw.split(','))))
     return boxes
+
+
+def _load_anchor_from_config(ocr_section) -> "tuple[int, int] | None":
+    """Legge anchor_x/anchor_y da una sezione [OCR] già caricata, se entrambi presenti."""
+    x = ocr_section.get('anchor_x')
+    y = ocr_section.get('anchor_y')
+    if x is None or y is None:
+        return None
+    return (int(x), int(y))
 
 
 BOX_COLORS = ["red", "blue", "green", "orange", "purple"]
