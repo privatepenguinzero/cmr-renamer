@@ -646,13 +646,13 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
 
     def _open_log(icon, item):
         try:
-            os.startfile(log_path)
+            os.startfile(os.path.normpath(log_path))
         except Exception as e:
             print(f"⚠️ Impossibile aprire il log: {e}")
 
     def _open_folder(icon, item):
         try:
-            os.startfile(cartella)
+            os.startfile(os.path.normpath(cartella))
         except Exception as e:
             print(f"⚠️ Impossibile aprire la cartella: {e}")
 
