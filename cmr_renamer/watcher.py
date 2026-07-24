@@ -183,6 +183,15 @@ def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     return clean
 
 
+def _render_pdf_page(path: str, dpi: int) -> "Image.Image":
+    """Renderizza la pagina 1 di un PDF come immagine PIL."""
+    immagini = convert_from_path(
+        path, dpi=dpi, first_page=1, last_page=1,
+        poppler_path=_get_poppler_path(),
+    )
+    return immagini[0]
+
+
 def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
     """Migliora un crop prima dell'OCR: scala di grigi, contrasto, binarizzazione.
 
@@ -578,11 +587,7 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
 def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
     """Esegue OCR e rinomina il PDF con il testo estratto."""
     try:
-        immagini = convert_from_path(
-            pdf_path, dpi=ocr_cfg['dpi'], first_page=1, last_page=1,
-            poppler_path=_get_poppler_path(),
-        )
-        img = immagini[0]
+        img = _render_pdf_page(pdf_path, ocr_cfg['dpi'])
 
         serve_calibrazione = len(ocr_cfg['boxes']) < MIN_BOXES
         if ocr_cfg['show_rects'] or serve_calibrazione:
