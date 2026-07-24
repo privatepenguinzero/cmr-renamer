@@ -374,12 +374,21 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
         'boxes': list(boxes),
         'active': 0, 'start': None, 'drag_id': None, 'result': None,
         'zoom': 1.0, 'photo': None, 'img': None, 'current_path': initial_path,
+        'reference_anchor': None, 'preview_shift': (0, 0),
     }
     drawn_ids: dict = {}
     select_buttons: dict = {}
 
+    def update_preview_shift():
+        current = _detect_content_anchor(state['img'])
+        state['preview_shift'] = _compute_anchor_shift(current, state['reference_anchor'], dpi)
+
     try:
         state['img'] = get_image(initial_path)
+        state['reference_anchor'] = _detect_content_anchor(state['img'])
+        # initial_path IS the reference for this session, so its own shift is always (0, 0);
+        # update_preview_shift() only needs to run again once a *different* file is selected
+        # (see on_file_select below) — no need to call it here too.
         root = Tk()
         root.title("CMR Renamer - Calibrazione box OCR")
 
@@ -447,7 +456,9 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
 
         def draw_box(index):
             scale = total_scale()
-            x1, y1, x2, y2 = [c * scale for c in state['boxes'][index]]
+            dx, dy = state['preview_shift']
+            bx1, by1, bx2, by2 = state['boxes'][index]
+            x1, y1, x2, y2 = [(bx1 + dx) * scale, (by1 + dy) * scale, (bx2 + dx) * scale, (by2 + dy) * scale]
             if index in drawn_ids:
                 canvas.delete(drawn_ids[index])
             drawn_ids[index] = canvas.create_rectangle(
@@ -566,6 +577,7 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
                 return
             state['img'] = new_img
             state['current_path'] = path
+            update_preview_shift()
             render()
 
         file_listbox.bind("<<ListboxSelect>>", on_file_select)
@@ -611,8 +623,12 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
             x0, x1 = sorted((x0, x1))
             y0, y1 = sorted((y0, y1))
 
+            dx, dy = state['preview_shift']
             index = state['active']
-            state['boxes'][index] = (int(x0 / scale), int(y0 / scale), int(x1 / scale), int(y1 / scale))
+            state['boxes'][index] = (
+                int(x0 / scale) - dx, int(y0 / scale) - dy,
+                int(x1 / scale) - dx, int(y1 / scale) - dy,
+            )
             draw_box(index)
 
         canvas.bind("<ButtonPress-1>", on_press)
