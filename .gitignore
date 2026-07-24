@@ -114,3 +114,6 @@ dmypy.txt
 
 # Pyre type checker
 .pyre/
+
+# Git worktrees used for isolated feature work
+.worktrees/
