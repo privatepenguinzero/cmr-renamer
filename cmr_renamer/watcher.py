@@ -202,6 +202,51 @@ def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
     return contrasted.point(lambda p: 255 if p > 128 else 0)
 
 
+_ANCHOR_DARK_THRESHOLD = 128  # stessa soglia di _preprocess_for_ocr
+_ANCHOR_MIN_DARK_FRACTION = 0.03  # frazione minima di pixel scuri per considerare una riga/colonna "contenuto"
+_ANCHOR_MIN_RUN = 4  # posizioni consecutive richieste, per ignorare rumore isolato (graffette, polvere)
+
+
+def _content_profile(binaria: "Image.Image", axis_size: int, vertical: bool) -> list:
+    """Frazione di pixel scuri per riga (vertical=True) o per colonna, via resize con filtro BOX."""
+    if vertical:
+        small = binaria.resize((1, axis_size), Image.BOX)
+    else:
+        small = binaria.resize((axis_size, 1), Image.BOX)
+    return [(255 - p) / 255 for p in small.getdata()]
+
+
+def _find_content_start(profile: list) -> "int | None":
+    """Primo indice con densità di scuro sufficiente, sostenuta per _ANCHOR_MIN_RUN posizioni."""
+    run = 0
+    for i, frac in enumerate(profile):
+        if frac >= _ANCHOR_MIN_DARK_FRACTION:
+            run += 1
+            if run >= _ANCHOR_MIN_RUN:
+                return i - _ANCHOR_MIN_RUN + 1
+        else:
+            run = 0
+    return None
+
+
+def _detect_content_anchor(img: "Image.Image") -> "tuple[int, int] | None":
+    """Rileva dove inizia il contenuto (non bianco) dall'alto e da sinistra della pagina.
+
+    Ritorna (anchor_x, anchor_y) in pixel, o None se non trova un bordo di contenuto sostenuto
+    (pagina quasi bianca).
+    """
+    gray = img.convert('L')
+    binaria = gray.point(lambda p: 0 if p < _ANCHOR_DARK_THRESHOLD else 255)
+    w, h = binaria.size
+
+    anchor_y = _find_content_start(_content_profile(binaria, h, vertical=True))
+    anchor_x = _find_content_start(_content_profile(binaria, w, vertical=False))
+
+    if anchor_x is None or anchor_y is None:
+        return None
+    return (anchor_x, anchor_y)
+
+
 def _file_pronto(path: str, timeout: int = 5) -> bool:
     """Aspetta che il file sia finito di scrivere dalla fotocopiatrice."""
     try:
