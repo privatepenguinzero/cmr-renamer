@@ -84,7 +84,7 @@ def load_or_create_config(config_path: str = None) -> "configparser.ConfigParser
         )
 
         config['OCR'] = {}
-        config['OCR']['lang'] = _prompt_console("Lingua OCR (eng/ita/fra)", "eng")
+        config['OCR']['lang'] = _prompt_console("Lingua OCR (eng/ita/deu/fra)", "eng")
         config['OCR']['dpi'] = _prompt_console("DPI per conversione PDF", "300")
         # box1..box5 are intentionally not asked here: they have no sensible
         # generic default and are selected with the mouse on the first PDF

@@ -65,7 +65,7 @@ separately:
   `vendor/poppler/COPYING.gpl2`.
 - **[Tesseract OCR](https://github.com/tesseract-ocr/tesseract)** (Apache License 2.0) — used by
   `pytesseract` to perform OCR. License text is included at `vendor/tesseract/LICENSE`. Only
-  `eng`/`ita`/`osd` language data is bundled; other OCR languages require a system-installed
+  `eng`/`ita`/`deu`/`osd` language data is bundled; other OCR languages require a system-installed
   Tesseract with that language's data.
 
 ## Acknowledgements
