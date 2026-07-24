@@ -23,6 +23,29 @@ def _prompt_console(prompt_text, default=None):
     return input(prompt_text + ": ").strip()
 
 
+def _parse_positive_int(value: str) -> "int | None":
+    """Converte una stringa in intero positivo, o None se non valida."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _build_lang_string(eng: bool, ita: bool, deu: bool, extra: str) -> str:
+    """Unisce le lingue selezionate (checkbox) e il testo extra in una stringa tipo 'eng+ita'."""
+    codes = []
+    if eng:
+        codes.append('eng')
+    if ita:
+        codes.append('ita')
+    if deu:
+        codes.append('deu')
+    extra_codes = [c.strip() for c in extra.split('+') if c.strip()]
+    codes.extend(extra_codes)
+    return '+'.join(codes)
+
+
 def _prompt_for_folder():
     """Prompt user to select a folder using GUI if available, else console."""
     if TKINTER_AVAILABLE:
