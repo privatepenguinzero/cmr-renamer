@@ -692,6 +692,36 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
     return pystray.Icon("cmr-renamer", icon_image, "CMR Renamer", menu)
 
 
+MAX_ANCHOR_SHIFT_MM = 15  # oltre questa soglia lo spostamento rilevato è considerato inaffidabile
+
+
+def _resolve_crop_boxes(img: "Image.Image", ocr_cfg: dict) -> list:
+    """Ritorna i box da ritagliare, corretti per la deriva di scansione quando possibile.
+
+    Se non c'è un'ancora di riferimento salvata, se l'ancora non è rilevabile sulla pagina
+    corrente, o se lo spostamento rilevato supera la soglia plausibile, ritorna i box calibrati
+    senza modifiche — il file viene comunque elaborato, solo senza correzione.
+    """
+    boxes = ocr_cfg['boxes']
+    reference = ocr_cfg.get('anchor')
+    if reference is None:
+        return boxes
+
+    current = _detect_content_anchor(img)
+    if current is None:
+        print("⚠️ Ancora di contenuto non rilevabile: uso i box calibrati senza correzione deriva.")
+        return boxes
+
+    dx = current[0] - reference[0]
+    dy = current[1] - reference[1]
+    max_shift_px = ocr_cfg['dpi'] * MAX_ANCHOR_SHIFT_MM / 25.4
+    if abs(dx) > max_shift_px or abs(dy) > max_shift_px:
+        print(f"⚠️ Spostamento rilevato ({dx}, {dy}px) oltre la soglia plausibile: uso i box calibrati senza correzione deriva.")
+        return boxes
+
+    return [(x1 + dx, y1 + dy, x2 + dx, y2 + dy) for (x1, y1, x2, y2) in boxes]
+
+
 def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
     """Esegue OCR e rinomina il PDF con il testo estratto."""
     try:
@@ -724,7 +754,7 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     _calibration_lock.release()
 
         parti = []
-        for box in ocr_cfg['boxes']:
+        for box in _resolve_crop_boxes(img, ocr_cfg):
             crop = _preprocess_for_ocr(img.crop(box))
             testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'])
             pulito = _pulisci_nome(testo, name_cfg['max_length'], name_cfg['remove_leading_zeros'])
