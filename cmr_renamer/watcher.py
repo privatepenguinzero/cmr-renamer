@@ -172,9 +172,16 @@ def _setup_file_logging(log_dir: str):
 # OCR & rename helpers
 # ──────────────────────────────────────────────────────────────
 
+# Caratteri non alfanumerici mantenuti nel nome file: tutti legali su Windows
+# (i vietati sono \ / : * ? " < > |). La & compare spesso nelle ragioni sociali
+# ("ROSSI & FIGLI"), l'apostrofo nei nomi italiani ("L'OREAL"). Il '-' deve
+# restare ultimo, altrimenti nella classe di caratteri diventa un intervallo.
+_EXTRA_NAME_CHARS = r".&'-"
+
+
 def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     """Pulisce il testo OCR per usarlo come nome file."""
-    clean = re.sub(r'[^\w\s.-]', '', testo).replace('\n', ' ').strip()
+    clean = re.sub(rf'[^\w\s{_EXTRA_NAME_CHARS}]', '', testo).replace('\n', ' ').strip()
     if len(clean) > max_len:
         clean = clean[:max_len]
     if rimuovi_zeri:
