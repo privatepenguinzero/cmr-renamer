@@ -13,7 +13,9 @@ import time
 import ctypes  # For Windows console manipulation
 import atexit
 import threading
+import json
 import configparser
+from xml.etree import ElementTree
 
 import pytesseract
 from pdf2image import convert_from_path
@@ -28,7 +30,7 @@ from .config import load_or_create_config
 # del backend e solleva un errore Xlib, non un ImportError. Un guard troppo stretto
 # faceva quindi crashare l'intero programma invece di lasciarlo senza tray.
 try:
-    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox
+    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox, messagebox
     from PIL import ImageTk
     TKINTER_AVAILABLE = True
 except Exception:
@@ -247,23 +249,97 @@ O_ZERO_ASPECT_DEFAULT = 0.80
 _GLIFI_O_ZERO = frozenset('Oo0')
 
 
-def _parse_glyph_boxes(raw: str) -> list:
-    """Interpreta l'output `makebox` di Tesseract in una lista di (carattere, larghezza, altezza).
+def _elementi_classe(radice, nome: str) -> list:
+    """Discendenti con `class` uguale a `nome`.
 
-    Ogni riga è `char left bottom right top page` con origine in basso a sinistra.
-    Le righe malformate vengono scartate: l'allineamento a valle se ne accorge.
+    Il match è sull'attributo class e non sul tag, così il namespace XHTML che
+    Tesseract emette (`{http://www.w3.org/1999/xhtml}span`) non va gestito.
     """
-    glifi = []
-    for riga in raw.splitlines():
-        parti = riga.split(' ')
-        if len(parti) < 5 or not parti[0]:
-            continue
-        try:
-            left, bottom, right, top = (int(v) for v in parti[1:5])
-        except ValueError:
-            continue
-        glifi.append((parti[0], right - left, top - bottom))
-    return glifi
+    return [el for el in radice.iter() if el.get('class') == nome]
+
+
+def _misura_bbox(title: "str | None") -> tuple:
+    """(larghezza, altezza) da un title hOCR contenente `x_bboxes x0 y0 x1 y1` o `bbox ...`.
+
+    Le coordinate hOCR hanno origine in ALTO a sinistra — al contrario del formato
+    makebox — quindi l'altezza è y1-y0. Invertirlo capovolgerebbe il rapporto
+    larghezza/altezza e con esso la discriminazione O/0.
+    """
+    if not title:
+        return (0, 0)
+    for chiave in ('x_bboxes', 'bbox'):
+        for campo in title.split(';'):
+            parti = campo.split()
+            if len(parti) >= 5 and parti[0] == chiave:
+                try:
+                    x0, y0, x1, y1 = (int(v) for v in parti[1:5])
+                except ValueError:
+                    continue
+                return (x1 - x0, y1 - y0)
+    return (0, 0)
+
+
+def _misura_wconf(title: "str | None") -> "float | None":
+    """Confidenza (0-100) da un title hOCR contenente `x_wconf N`."""
+    if not title:
+        return None
+    for campo in title.split(';'):
+        parti = campo.split()
+        if len(parti) >= 2 and parti[0] == 'x_wconf':
+            try:
+                return float(parti[1])
+            except ValueError:
+                return None
+    return None
+
+
+def _parse_hocr(xml_bytes: bytes) -> dict:
+    """Estrae testo, geometria per carattere e confidenza da un hOCR di Tesseract.
+
+    Ritorna {'testo': str, 'glifi': [(carattere, larghezza, altezza)], 'confidenze': [float]}.
+    `glifi` ha un elemento per ogni carattere non-spazio di `testo`, nello stesso
+    ordine: l'allineamento è per costruzione, non ricostruito a posteriori come
+    servirebbe confrontando due letture indipendenti.
+
+    Un `ocrx_word` privo di figli `ocrx_cinfo` (char box non richiesti o non
+    prodotti) contribuisce comunque al testo, con glifi segnaposto ad altezza 0
+    che `_correggi_o_zero` salta.
+
+    Solleva su XML malformato: il chiamante ripiega su `image_to_string`.
+    """
+    radice = ElementTree.fromstring(xml_bytes)
+    righe, glifi, confidenze = [], [], []
+
+    for riga_el in _elementi_classe(radice, 'ocr_line'):
+        parole = []
+        for parola_el in _elementi_classe(riga_el, 'ocrx_word'):
+            conf = _misura_wconf(parola_el.get('title'))
+            if conf is not None:
+                confidenze.append(conf)
+
+            cinfo = _elementi_classe(parola_el, 'ocrx_cinfo')
+            if cinfo:
+                testo_parola = ''
+                for c in cinfo:
+                    contenuto = (c.text or '').strip()
+                    if not contenuto:
+                        continue
+                    larghezza, altezza = _misura_bbox(c.get('title'))
+                    testo_parola += contenuto
+                    # Il contenuto è normalmente un solo carattere; se non lo
+                    # fosse, un glifo per carattere mantiene l'allineamento.
+                    glifi.extend((ch, larghezza, altezza) for ch in contenuto)
+            else:
+                testo_parola = ''.join(parola_el.itertext()).strip()
+                glifi.extend((ch, 0, 0) for ch in testo_parola if not ch.isspace())
+
+            if testo_parola:
+                parole.append(testo_parola)
+
+        if parole:
+            righe.append(' '.join(parole))
+
+    return {'testo': '\n'.join(righe), 'glifi': glifi, 'confidenze': confidenze}
 
 
 def _caso_da_contesto(caratteri: list, pos: int) -> str:
@@ -284,11 +360,11 @@ def _caso_da_contesto(caratteri: list, pos: int) -> str:
 def _correggi_o_zero(testo: str, glifi: list, soglia: float, log_forme: bool = False) -> str:
     """Ridecide ogni glifo O/o/0 del testo in base alla forma misurata sull'immagine.
 
-    `glifi` è la sequenza restituita da `_parse_glyph_boxes`: gli stessi caratteri
-    del testo, nello stesso ordine, ma senza spazi né ritorni a capo. Se le due
-    sequenze non si allineano, la misura non è attribuibile ai caratteri giusti e
-    il testo viene restituito intatto — meglio nessuna correzione che una applicata
-    al glifo sbagliato.
+    `glifi` è la sequenza restituita da `_parse_hocr`: gli stessi caratteri del
+    testo, nello stesso ordine, ma senza spazi né ritorni a capo. Provenendo dal
+    medesimo parse, l'allineamento è garantito per costruzione; i controlli qui
+    sotto restano come rete di sicurezza contro un parser modificato male, e
+    fanno tornare il testo intatto anziché applicare una misura al glifo sbagliato.
 
     A differenza di una conversione per classe, qui una cifra che è davvero una
     cifra e una lettera che è davvero una lettera restano quello che sono.
@@ -331,25 +407,164 @@ def _correggi_o_zero(testo: str, glifi: list, soglia: float, log_forme: bool = F
     return ''.join(caratteri)
 
 
-def _rifinisci_o_zero(crop: "Image.Image", testo: str, ocr_cfg: dict) -> str:
-    """Corregge i glifi O/0 di `testo` misurandoli, con una seconda passata di Tesseract.
+# x_wconf va da 0 a 100. Sotto questa soglia il nome estratto viene comunque usato,
+# con un avviso nel log: un OCR incerto è spesso ancora corretto, e bloccare la
+# rinomina farebbe più danni che segnalarla.
+OCR_MIN_CONFIDENCE_DEFAULT = 60.0
 
-    La passata extra si fa solo se serve (il testo contiene almeno un glifo
-    ambiguo) e non è mai bloccante: se fallisce si tiene la lettura originale.
+
+def _ocr_box(crop: "Image.Image", ocr_cfg: dict) -> dict:
+    """OCR di un ritaglio in una sola invocazione di Tesseract.
+
+    Ritorna {'testo': str, 'confidenza_min': float | None}.
+
+    L'output hOCR con `hocr_char_boxes=1` porta testo, geometria per carattere e
+    confidenza per parola nello stesso documento, quindi la correzione O/0 non
+    richiede più una seconda invocazione: un solo processo Tesseract per ritaglio
+    invece di due, e nessun riallineamento tra letture indipendenti.
+
+    Se la chiamata hOCR o il suo parsing falliscono si ripiega su
+    `image_to_string` senza correzione: un'API più ricca non deve rendere il
+    programma più fragile di com'era.
     """
-    if not any(c in _GLIFI_O_ZERO for c in testo):
-        return testo
-    config = _ocr_config(ocr_cfg.get('psm', OCR_PSM_DEFAULT))
+    psm = ocr_cfg.get('psm', OCR_PSM_DEFAULT)
+    config = f"{_ocr_config(psm)} -c hocr_char_boxes=1"
     try:
-        raw = pytesseract.image_to_boxes(crop, lang=ocr_cfg['lang'], config=config)
+        xml = pytesseract.image_to_pdf_or_hocr(
+            crop, lang=ocr_cfg['lang'], config=config, extension='hocr',
+        )
+        risultato = _parse_hocr(xml)
     except Exception as e:
-        print(f"⚠️ Impossibile misurare la forma dei glifi O/0: {e}")
-        return testo
-    return _correggi_o_zero(
-        testo, _parse_glyph_boxes(raw),
+        print(f"⚠️ Lettura hOCR non riuscita ({e}): ripiego sull'OCR semplice, senza correzione O/0.")
+        try:
+            testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'], config=_ocr_config(psm))
+        except Exception as e2:
+            print(f"❌ OCR non riuscito: {e2}")
+            return {'testo': '', 'confidenza_min': None}
+        return {'testo': testo, 'confidenza_min': None}
+
+    testo = _correggi_o_zero(
+        risultato['testo'], risultato['glifi'],
         ocr_cfg.get('o_zero_aspect', O_ZERO_ASPECT_DEFAULT),
         ocr_cfg.get('log_forme', False),
     )
+    confidenze = risultato['confidenze']
+    return {
+        # Il minimo, non la media: è la parola peggiore che rovina il nome file.
+        'testo': testo,
+        'confidenza_min': min(confidenze) if confidenze else None,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# Rename journal (undo support)
+# ──────────────────────────────────────────────────────────────
+
+# Timestamp ISO dell'avvio del processo, usato per raggruppare le rinomine in
+# "sessioni". Tenerlo nel giornale anziché solo in memoria fa sì che l'undo
+# funzioni anche dopo un riavvio dell'exe. Inizializzato in run().
+_SESSIONE_ID = None
+
+
+def _percorso_giornale() -> str:
+    """Percorso di rinomine.log, accanto a config.ini."""
+    return os.path.join(_get_config_dir(), 'rinomine.log')
+
+
+def _registra_rinomina(cartella: str, originale: str, nuovo: str) -> None:
+    """Aggiunge una rinomina al giornale. Mai bloccante.
+
+    Un JSON per riga anziché TSV: dopo un OCR sfortunato un nome file può
+    contenere qualunque cosa, tabulazioni incluse. Un errore di scrittura viene
+    segnalato e ignorato — la rinomina è già avvenuta, e far fallire il file per
+    non aver potuto annotarlo sarebbe il rimedio peggiore del male.
+    """
+    voce = {
+        'sessione': _SESSIONE_ID,
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'cartella': cartella,
+        'da': originale,
+        'a': nuovo,
+    }
+    try:
+        with open(_percorso_giornale(), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(voce, ensure_ascii=False) + '\n')
+    except OSError as e:
+        print(f"⚠️ Impossibile aggiornare il giornale delle rinomine: {e}")
+
+
+def _leggi_giornale() -> list:
+    """Voci del giornale, saltando le righe illeggibili.
+
+    Una riga troncata (crash a metà scrittura) non deve rendere inutilizzabile
+    tutto lo storico.
+    """
+    percorso = _percorso_giornale()
+    if not os.path.exists(percorso):
+        return []
+    voci = []
+    try:
+        with open(percorso, encoding='utf-8') as f:
+            for riga in f:
+                riga = riga.strip()
+                if not riga:
+                    continue
+                try:
+                    voci.append(json.loads(riga))
+                except ValueError:
+                    continue
+    except OSError as e:
+        print(f"⚠️ Impossibile leggere il giornale delle rinomine: {e}")
+        return []
+    return voci
+
+
+def _rinomine_annullabili() -> list:
+    """Rinomine dell'ultima sessione, se non è già stata annullata."""
+    voci = _leggi_giornale()
+    sessioni = [v.get('sessione') for v in voci if v.get('sessione')]
+    if not sessioni:
+        return []
+    ultima = sessioni[-1]
+    della_sessione = [v for v in voci if v.get('sessione') == ultima]
+    if any(v.get('tipo') == 'undo' for v in della_sessione):
+        return []
+    return [v for v in della_sessione if v.get('da') and v.get('a')]
+
+
+def _annulla_rinomine() -> tuple:
+    """Ripristina i nomi originali dell'ultima sessione. Ritorna (ripristinati, saltati).
+
+    Procede in ordine inverso, così una catena A→B→C torna ad A. Una voce viene
+    saltata se il file col nome nuovo non c'è più o se il nome originale è già
+    occupato: un undo parziale con un conteggio onesto è preferibile a uno che si
+    interrompe a metà lasciando stato incoerente.
+    """
+    voci = _rinomine_annullabili()
+    if not voci:
+        return (0, 0)
+    ripristinati = saltati = 0
+    for v in reversed(voci):
+        attuale = os.path.join(v['cartella'], v['a'])
+        originale = os.path.join(v['cartella'], v['da'])
+        if not os.path.exists(attuale) or os.path.exists(originale):
+            saltati += 1
+            continue
+        try:
+            os.rename(attuale, originale)
+            ripristinati += 1
+        except OSError as e:
+            print(f"⚠️ Impossibile ripristinare '{v['a']}': {e}")
+            saltati += 1
+    try:
+        with open(_percorso_giornale(), 'a', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'sessione': voci[0]['sessione'], 'tipo': 'undo',
+                'ts': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            }, ensure_ascii=False) + '\n')
+    except OSError as e:
+        print(f"⚠️ Impossibile marcare l'annullamento nel giornale: {e}")
+    return (ripristinati, saltati)
 
 
 _ANCHOR_DARK_THRESHOLD = 128  # stessa soglia di _preprocess_for_ocr
@@ -501,14 +716,16 @@ def _list_watched_pdfs(folder: str) -> list:
     return [os.path.join(folder, f) for f in nomi]
 
 
-def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
+def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, ocr_cfg: dict, name_cfg: dict):
     """Mostra la pagina 1 di un PDF a scelta tra `pdf_paths` e permette di ridisegnare 2-5 box col mouse.
 
     `pdf_paths` è l'elenco dei PDF della cartella monitorata, selezionabili da una lista laterale
     per confrontare visivamente se i box calibrati si applicano bene a più documenti; il cambio file
     ridisegna solo l'immagine di sfondo e sposta i box del solo scostamento di deriva rilevato.
     `initial_path` è il file mostrato all'apertura (preselezionato in lista). `boxes` è una lista di
-    partenza di 2-5 tuple (x1,y1,x2,y2). Se l'utente salva, ritorna
+    partenza di 2-5 tuple (x1,y1,x2,y2). `ocr_cfg`/`name_cfg` servono al pulsante "Prova OCR", che
+    esegue la stessa catena di `_rinomina_pdf` sui box correnti; il dpi di rendering viene da
+    `ocr_cfg['dpi']`. Se l'utente salva, ritorna
     {'boxes': [...], 'anchor': (x,y) | None} — l'ancora è rilevata
     sull'immagine visualizzata al momento del salvataggio (non necessariamente quella di
     `initial_path`, se nel frattempo si è passati a un altro file dalla lista). Ritorna None se
@@ -517,6 +734,8 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
     if not TKINTER_AVAILABLE:
         print("⚠️ tkinter non disponibile: calibrazione box saltata.")
         return None
+
+    dpi = ocr_cfg['dpi']
 
     MIN_DRAG = 4  # px — ignore accidental clicks/near-zero drags
     MAX_ZOOM = 6.0  # relative to the initial fit-to-screen view
@@ -808,6 +1027,43 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
             state['result'] = None
             root.destroy()
 
+        prova_label = Label(root, text="", justify="left", anchor="w", fg="#004400")
+        prova_label.pack(fill="x", padx=8, pady=(0, 6))
+
+        def on_prova():
+            """Esegue l'OCR sui box correnti e mostra cosa produrrebbero.
+
+            Usa lo stesso `preview_shift` applicato al disegno, così misura
+            esattamente i ritagli che il programma userebbe su questo file, e la
+            stessa catena `_ocr_box` → `_pulisci_nome` → join di `_rinomina_pdf`.
+            """
+            prova_label.config(text="Prova in corso...", fg="#444444")
+            # L'OCR è sincrono e blocca la finestra: si forza il ridisegno prima.
+            root.update_idletasks()
+            dx, dy = state['preview_shift']
+            righe, parti = [], []
+            try:
+                for i, (x1, y1, x2, y2) in enumerate(state['boxes'], start=1):
+                    crop = _preprocess_for_ocr(
+                        state['img'].crop((x1 + dx, y1 + dy, x2 + dx, y2 + dy))
+                    )
+                    letto = _ocr_box(crop, ocr_cfg)
+                    pulito = _pulisci_nome(
+                        letto['testo'], name_cfg['max_length'], name_cfg['remove_leading_zeros'],
+                    )
+                    if pulito:
+                        parti.append(pulito)
+                    conf = letto['confidenza_min']
+                    conf_txt = "n/d" if conf is None else f"{conf:.0f}"
+                    righe.append(f"Box {i}: '{pulito}'   (confidenza {conf_txt})")
+            except Exception as e:
+                prova_label.config(text=f"Prova non riuscita: {e}", fg="#880000")
+                return
+            nome = " ".join(parti).strip() or "documento_senza_nome"
+            righe.append(f"→ nome file: '{nome}.pdf'")
+            prova_label.config(text="\n".join(righe), fg="#004400")
+
+        Button(btn_frame, text="Prova OCR", command=on_prova).pack(side="left", padx=5)
         Button(btn_frame, text="Salva", command=on_save).pack(side="left", padx=5)
         Button(btn_frame, text="Annulla", command=on_cancel).pack(side="left", padx=5)
 
@@ -818,7 +1074,7 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
         return None
 
 
-def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
+def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, name_cfg: dict, log_path: str,
                       cartella: str, stop_event: "threading.Event") -> "pystray.Icon":
     """Crea l'icona di system tray con il menu di controllo del background mode."""
 
@@ -846,7 +1102,7 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
             boxes_seed = list(ocr_cfg['boxes'])
             while len(boxes_seed) < MIN_BOXES:
                 boxes_seed.append(_default_box(len(boxes_seed)))
-            risultato = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg['dpi'])
+            risultato = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg, name_cfg)
             if risultato:
                 ocr_cfg['boxes'] = risultato['boxes']
                 ocr_cfg['anchor'] = risultato['anchor']
@@ -857,6 +1113,31 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
         finally:
             _calibration_lock.release()
 
+    def _annulla(icon, item):
+        voci = _rinomine_annullabili()
+        if not voci:
+            print("⚠️ Nessuna rinomina da annullare in questa sessione.")
+            return
+        # Tocca file su una condivisione di rete e una voce di menu è troppo
+        # facile da centrare per sbaglio: si chiede conferma quando è possibile.
+        if TKINTER_AVAILABLE:
+            try:
+                radice = Tk()
+                radice.withdraw()
+                conferma = messagebox.askyesno(
+                    "CMR Renamer",
+                    f"Ripristinare i nomi originali di {len(voci)} file rinominati "
+                    f"in questa sessione?",
+                )
+                radice.destroy()
+                if not conferma:
+                    print("↩️ Annullamento non confermato: nessuna modifica.")
+                    return
+            except Exception as e:
+                print(f"⚠️ Impossibile mostrare la conferma ({e}): procedo comunque.")
+        ripristinati, saltati = _annulla_rinomine()
+        print(f"↩️ Annullamento completato: {ripristinati} ripristinati, {saltati} saltati.")
+
     def _exit(icon, item):
         icon.stop()
         stop_event.set()
@@ -865,6 +1146,7 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
         pystray.MenuItem("Apri log", _open_log),
         pystray.MenuItem("Apri cartella monitorata", _open_folder),
         pystray.MenuItem("Ricalibra box", _recalibra),
+        pystray.MenuItem("Annulla ultime rinomine", _annulla),
         pystray.MenuItem("Esci", _exit),
     )
     return pystray.Icon("cmr-renamer", icon_image, "CMR Renamer", menu)
@@ -935,7 +1217,7 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     while len(boxes_seed) < MIN_BOXES:
                         boxes_seed.append(_default_box(len(boxes_seed)))
                     pdf_paths = _list_watched_pdfs(os.path.dirname(pdf_path))
-                    risultato = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg['dpi'])
+                    risultato = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg, name_cfg)
                     if risultato:
                         ocr_cfg['boxes'] = risultato['boxes']
                         ocr_cfg['anchor'] = risultato['anchor']
@@ -948,14 +1230,17 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     _calibration_lock.release()
 
         parti = []
-        psm = ocr_cfg.get('psm', OCR_PSM_DEFAULT)
-        for box in _resolve_crop_boxes(img, ocr_cfg):
+        soglia_conf = ocr_cfg.get('min_confidence', OCR_MIN_CONFIDENCE_DEFAULT)
+        for i, box in enumerate(_resolve_crop_boxes(img, ocr_cfg), start=1):
             crop = _preprocess_for_ocr(img.crop(box))
-            testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'], config=_ocr_config(psm))
-            # Va fatto sul testo grezzo, prima che _pulisci_nome tronchi a
-            # max_length o rimuova gli zeri iniziali.
-            testo = _rifinisci_o_zero(crop, testo, ocr_cfg)
-            pulito = _pulisci_nome(testo, name_cfg['max_length'], name_cfg['remove_leading_zeros'])
+            letto = _ocr_box(crop, ocr_cfg)
+            conf = letto['confidenza_min']
+            if conf is not None and conf < soglia_conf:
+                print(f"⚠️ Box {i}: confidenza OCR bassa ({conf:.0f} < {soglia_conf:.0f}). "
+                      f"Rinomino comunque, ma il nome potrebbe essere errato.")
+            # _pulisci_nome va dopo la correzione O/0 (già fatta in _ocr_box),
+            # perché tronca a max_length e rimuove gli zeri iniziali.
+            pulito = _pulisci_nome(letto['testo'], name_cfg['max_length'], name_cfg['remove_leading_zeros'])
             if pulito:
                 parti.append(pulito)
 
@@ -965,6 +1250,7 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
 
         dest_dir = os.path.dirname(pdf_path)
         nuovo_path = os.path.join(dest_dir, f"{base}.pdf")
+        nome_originale = os.path.basename(pdf_path)
 
         if not os.path.exists(nuovo_path):
             os.rename(pdf_path, nuovo_path)
@@ -976,6 +1262,7 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                 counter += 1
             os.rename(pdf_path, nuovo_path)
             print(f"✅ Rinominato → '{os.path.basename(nuovo_path)}' (conflitto risolto)")
+        _registra_rinomina(dest_dir, nome_originale, os.path.basename(nuovo_path))
 
     except Exception as e:
         print(f"❌ Errore per '{os.path.basename(pdf_path)}': {e}")
@@ -1035,6 +1322,11 @@ def run() -> int:
 
     Returns 0 on success.
     """
+    global _SESSIONE_ID
+    # Marca tutte le rinomine di questa esecuzione, così "Annulla ultime rinomine"
+    # sa cosa ripristinare anche dopo un riavvio dell'exe.
+    _SESSIONE_ID = time.strftime('%Y-%m-%dT%H:%M:%S')
+
     config_dir = _get_config_dir()
     config_path = os.path.join(config_dir, 'config.ini')
     config_exists = os.path.exists(config_path)
@@ -1110,6 +1402,7 @@ def run() -> int:
         'dpi': int(cfg['OCR']['dpi']),
         'psm': cfg['OCR'].getint('psm', fallback=OCR_PSM_DEFAULT),
         'o_zero_aspect': cfg['OCR'].getfloat('o_zero_aspect', fallback=O_ZERO_ASPECT_DEFAULT),
+        'min_confidence': cfg['OCR'].getfloat('min_confidence', fallback=OCR_MIN_CONFIDENCE_DEFAULT),
         'log_forme': cfg['OCR'].getboolean('log_forme', fallback=False),
     }
 
@@ -1153,7 +1446,7 @@ def run() -> int:
         try:
             icon_image = Image.open(_get_resource_path(os.path.join('assets', 'icon.ico')))
             log_path = os.path.join(config_dir, 'cmr-renamer.log')
-            tray_icon = _build_tray_icon(icon_image, ocr_cfg, log_path, cartella, stop_event)
+            tray_icon = _build_tray_icon(icon_image, ocr_cfg, name_cfg, log_path, cartella, stop_event)
             threading.Thread(target=tray_icon.run, daemon=True).start()
         except Exception as e:
             print(f"⚠️ Icona di system tray non disponibile: {e}")
