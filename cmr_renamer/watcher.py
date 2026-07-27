@@ -193,55 +193,6 @@ def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     return clean
 
 
-# Tipo di carattere atteso in un box, scelto nel calibratore e salvato in config.ini.
-# Serve a disambiguare le coppie che Tesseract confonde quando manca il contesto
-# linguistico (O/0, I/1, S/5...). tessedit_char_whitelist non è utilizzabile allo
-# scopo: col motore LSTM di Tesseract 4/5 viene ignorato o degrada il risultato,
-# in particolare sui set con accentate — e i tessdata_fast che imbarchiamo non
-# contengono i dati del motore legacy dove funzionerebbe.
-CHAR_MODE_MISTO = "misto"
-CHAR_MODE_TESTO = "testo"
-CHAR_MODE_NUMERI = "numeri"
-CHAR_MODES = (CHAR_MODE_MISTO, CHAR_MODE_TESTO, CHAR_MODE_NUMERI)
-
-CHAR_MODE_LABELS = {
-    CHAR_MODE_MISTO: "Misto",
-    CHAR_MODE_TESTO: "Testo",
-    CHAR_MODE_NUMERI: "Numeri",
-}
-
-# Cifre che Tesseract produce al posto della lettera corrispondente.
-_CONFUSIONI_VERSO_LETTERA = {
-    '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B',
-}
-
-# Lettere che Tesseract produce al posto della cifra corrispondente. Volutamente
-# conservativa: T/7, A/4, q/9 causerebbero più falsi positivi che correzioni.
-_CONFUSIONI_VERSO_CIFRA = {
-    'O': '0', 'o': '0', 'D': '0',
-    'I': '1', 'l': '1', 'i': '1',
-    'Z': '2', 'z': '2',
-    'S': '5', 's': '5',
-    'G': '6', 'g': '6',
-    'B': '8',
-}
-
-
-def _correggi_confusioni(testo: str, modo: str) -> str:
-    """Corregge le coppie di caratteri confondibili in base al tipo dichiarato del box.
-
-    `misto` (default) non tocca nulla. Un modo sconosciuto — es. config.ini
-    modificato a mano — viene trattato come `misto` anziché sollevare.
-    """
-    if modo == CHAR_MODE_TESTO:
-        mappa = _CONFUSIONI_VERSO_LETTERA
-    elif modo == CHAR_MODE_NUMERI:
-        mappa = _CONFUSIONI_VERSO_CIFRA
-    else:
-        return testo
-    return ''.join(mappa.get(c, c) for c in testo)
-
-
 def _render_pdf_page(path: str, dpi: int) -> "Image.Image":
     """Renderizza la pagina 1 di un PDF come immagine PIL."""
     immagini = convert_from_path(
@@ -356,8 +307,8 @@ MAX_BOXES = 5
 _calibration_lock = threading.Lock()
 
 
-def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None", char_modes: list) -> None:
-    """Salva coordinate dei box (2-5), tipo di carattere per box e ancora di contenuto nel config.ini esistente."""
+def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None") -> None:
+    """Salva le coordinate di tutti i box (2-5) e l'ancora di contenuto nel config.ini esistente."""
     config_path = os.path.join(_get_config_dir(), 'config.ini')
     config = configparser.ConfigParser()
     config.read(config_path)
@@ -365,12 +316,13 @@ def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None", c
         config['OCR'] = {}
     for i, box in enumerate(boxes, start=1):
         config['OCR'][f'box{i}'] = ','.join(str(int(v)) for v in box)
-    for i, modo in enumerate(char_modes[:len(boxes)], start=1):
-        config['OCR'][f'box{i}_chars'] = modo
     # Rimuove eventuali chiavi box(N+1).. rimaste da una configurazione precedente
     # con più box (es. da 4 box a 3: box4 va eliminato, non lasciato stantio).
-    for i in range(len(boxes) + 1, MAX_BOXES + 1):
-        config['OCR'].pop(f'box{i}', None)
+    # box{N}_chars veniva scritta da una versione intermedia mai rilasciata: si
+    # rimuove sempre, così un config.ini che l'avesse non resta con chiavi morte.
+    for i in range(1, MAX_BOXES + 1):
+        if i > len(boxes):
+            config['OCR'].pop(f'box{i}', None)
         config['OCR'].pop(f'box{i}_chars', None)
     if anchor is not None:
         config['OCR']['anchor_x'] = str(int(anchor[0]))
@@ -395,20 +347,6 @@ def _load_boxes_from_config(ocr_section) -> list:
             break
         boxes.append(tuple(map(int, raw.split(','))))
     return boxes
-
-
-def _load_char_modes_from_config(ocr_section, n_boxes: int) -> list:
-    """Legge box1_chars..box5_chars, riempiendo con `misto` ciò che manca o non è valido.
-
-    Ritorna sempre esattamente `n_boxes` elementi: i config.ini creati prima che
-    questa opzione esistesse non hanno nessuna di queste chiavi e devono comportarsi
-    come oggi, cioè senza correzione.
-    """
-    modes = []
-    for i in range(1, n_boxes + 1):
-        raw = (ocr_section.get(f'box{i}_chars') or '').strip().lower()
-        modes.append(raw if raw in CHAR_MODES else CHAR_MODE_MISTO)
-    return modes
 
 
 def _load_anchor_from_config(ocr_section) -> "tuple[int, int] | None":
@@ -445,16 +383,15 @@ def _list_watched_pdfs(folder: str) -> list:
     return [os.path.join(folder, f) for f in nomi]
 
 
-def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, char_modes: list, dpi: int):
+def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
     """Mostra la pagina 1 di un PDF a scelta tra `pdf_paths` e permette di ridisegnare 2-5 box col mouse.
 
     `pdf_paths` è l'elenco dei PDF della cartella monitorata, selezionabili da una lista laterale
     per confrontare visivamente se i box calibrati si applicano bene a più documenti; il cambio file
     ridisegna solo l'immagine di sfondo e sposta i box del solo scostamento di deriva rilevato.
     `initial_path` è il file mostrato all'apertura (preselezionato in lista). `boxes` è una lista di
-    partenza di 2-5 tuple (x1,y1,x2,y2); `char_modes` il tipo di carattere atteso per ciascun box
-    (valori in CHAR_MODES), normalizzato a `misto` dove manca. Se l'utente salva, ritorna
-    {'boxes': [...], 'char_modes': [...], 'anchor': (x,y) | None} — l'ancora è rilevata
+    partenza di 2-5 tuple (x1,y1,x2,y2). Se l'utente salva, ritorna
+    {'boxes': [...], 'anchor': (x,y) | None} — l'ancora è rilevata
     sull'immagine visualizzata al momento del salvataggio (non necessariamente quella di
     `initial_path`, se nel frattempo si è passati a un altro file dalla lista). Ritorna None se
     l'utente annulla.
@@ -474,17 +411,11 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, char_modes: li
             image_cache[path] = _render_pdf_page(path, dpi)
         return image_cache[path]
 
-    modes_iniziali = [
-        char_modes[i] if i < len(char_modes) and char_modes[i] in CHAR_MODES else CHAR_MODE_MISTO
-        for i in range(len(boxes))
-    ]
-
     state = {
         'boxes': list(boxes),
-        'char_modes': modes_iniziali,
         'active': 0, 'start': None, 'drag_id': None, 'result': None,
         'zoom': 1.0, 'photo': None, 'img': None, 'current_path': initial_path,
-        'reference_anchor': None, 'preview_shift': (0, 0), 'syncing': False,
+        'reference_anchor': None, 'preview_shift': (0, 0),
     }
     drawn_ids: dict = {}
     select_buttons: dict = {}
@@ -524,12 +455,6 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, char_modes: li
 
         zoom_frame = Frame(top_frame)
         zoom_frame.pack(side="left", padx=20)
-
-        mode_frame = Frame(top_frame)
-        mode_frame.pack(side="left", padx=20)
-
-        Label(mode_frame, text="Contenuto:").pack(side="left")
-        mode_var = StringVar(value=CHAR_MODE_MISTO)
 
         label = Label(root, text="")
         label.pack(pady=2)
@@ -632,26 +557,10 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, char_modes: li
         Button(zoom_frame, text="+", command=zoom_in, width=3).pack(side="left")
         Button(zoom_frame, text="Reset zoom", command=zoom_reset).pack(side="left", padx=8)
 
-        def on_mode_change():
-            # set_active() aggiorna mode_var per riflettere il box appena selezionato:
-            # senza questa guardia quella scrittura verrebbe riapplicata al box attivo.
-            if state['syncing']:
-                return
-            state['char_modes'][state['active']] = mode_var.get()
-
-        for modo in CHAR_MODES:
-            Radiobutton(
-                mode_frame, text=CHAR_MODE_LABELS[modo], value=modo,
-                variable=mode_var, command=on_mode_change,
-            ).pack(side="left")
-
         def set_active(index):
             state['active'] = index
             for i, btn in select_buttons.items():
                 btn.config(relief=("sunken" if i == index else "raised"))
-            state['syncing'] = True
-            mode_var.set(state['char_modes'][index])
-            state['syncing'] = False
             label.config(text=f"Box attivo: {_box_label(index)}. Trascina col mouse per ridisegnarlo (rotellina per zoomare).")
 
         def update_count_buttons():
@@ -675,7 +584,6 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, char_modes: li
             if len(state['boxes']) >= MAX_BOXES:
                 return
             state['boxes'].append(_default_box(len(state['boxes'])))
-            state['char_modes'].append(CHAR_MODE_MISTO)
             rebuild_select_buttons()
             set_active(len(state['boxes']) - 1)
             render()
@@ -685,7 +593,6 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, char_modes: li
                 return
             removed = state['active']
             del state['boxes'][removed]
-            del state['char_modes'][removed]
             rebuild_select_buttons()
             set_active(max(removed - 1, 0))
             render()
@@ -775,7 +682,6 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, char_modes: li
         def on_save():
             state['result'] = {
                 'boxes': list(state['boxes']),
-                'char_modes': list(state['char_modes']),
                 'anchor': _detect_content_anchor(state['img']),
             }
             root.destroy()
@@ -820,17 +726,13 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
                 print("⚠️ Nessun PDF trovato nella cartella monitorata.")
                 return
             boxes_seed = list(ocr_cfg['boxes'])
-            modes_seed = list(ocr_cfg.get('char_modes', []))
             while len(boxes_seed) < MIN_BOXES:
                 boxes_seed.append(_default_box(len(boxes_seed)))
-            while len(modes_seed) < len(boxes_seed):
-                modes_seed.append(CHAR_MODE_MISTO)
-            risultato = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, modes_seed, ocr_cfg['dpi'])
+            risultato = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg['dpi'])
             if risultato:
                 ocr_cfg['boxes'] = risultato['boxes']
-                ocr_cfg['char_modes'] = risultato['char_modes']
                 ocr_cfg['anchor'] = risultato['anchor']
-                _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'], ocr_cfg['char_modes'])
+                _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'])
                 print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
         except Exception as e:
             print(f"⚠️ Errore durante la ricalibrazione: {e}")
@@ -912,18 +814,14 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     if serve_calibrazione:
                         print("🖱️ Box OCR non ancora configurati: selezionali con il mouse.")
                     boxes_seed = list(ocr_cfg['boxes'])
-                    modes_seed = list(ocr_cfg.get('char_modes', []))
                     while len(boxes_seed) < MIN_BOXES:
                         boxes_seed.append(_default_box(len(boxes_seed)))
-                    while len(modes_seed) < len(boxes_seed):
-                        modes_seed.append(CHAR_MODE_MISTO)
                     pdf_paths = _list_watched_pdfs(os.path.dirname(pdf_path))
-                    risultato = _calibra_box(pdf_paths, pdf_path, boxes_seed, modes_seed, ocr_cfg['dpi'])
+                    risultato = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg['dpi'])
                     if risultato:
                         ocr_cfg['boxes'] = risultato['boxes']
-                        ocr_cfg['char_modes'] = risultato['char_modes']
                         ocr_cfg['anchor'] = risultato['anchor']
-                        _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'], ocr_cfg['char_modes'])
+                        _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'])
                         print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
                     elif serve_calibrazione:
                         print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
@@ -932,15 +830,10 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     _calibration_lock.release()
 
         parti = []
-        modes = ocr_cfg.get('char_modes', [])
         psm = ocr_cfg.get('psm', OCR_PSM_DEFAULT)
-        for i, box in enumerate(_resolve_crop_boxes(img, ocr_cfg)):
+        for box in _resolve_crop_boxes(img, ocr_cfg):
             crop = _preprocess_for_ocr(img.crop(box))
             testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'], config=_ocr_config(psm))
-            # La correzione va applicata al testo grezzo, prima che _pulisci_nome
-            # tronchi a max_length o rimuova gli zeri iniziali.
-            modo = modes[i] if i < len(modes) else CHAR_MODE_MISTO
-            testo = _correggi_confusioni(testo, modo)
             pulito = _pulisci_nome(testo, name_cfg['max_length'], name_cfg['remove_leading_zeros'])
             if pulito:
                 parti.append(pulito)
@@ -1089,7 +982,6 @@ def run() -> int:
     boxes = _load_boxes_from_config(cfg['OCR'])
     ocr_cfg = {
         'boxes': boxes,
-        'char_modes': _load_char_modes_from_config(cfg['OCR'], len(boxes)),
         'anchor': _load_anchor_from_config(cfg['OCR']),
         'show_rects': cfg['OCR'].getboolean('show_rects', fallback=False),
         'lang': cfg['OCR']['lang'],
