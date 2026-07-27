@@ -67,7 +67,8 @@ positive integers (`_parse_positive_int`) and requiring at least one language be
 Falls back to the original per-field console prompts if `tkinter` is unavailable or the form is
 closed without saving.
 Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1..box5 crop coordinates
-for 2-5 boxes, anchor_x/anchor_y content-anchor reference, show_rects debug flag, lang, dpi),
+for 2-5 boxes, anchor_x/anchor_y content-anchor reference, show_rects debug flag, lang, dpi, psm,
+o_zero_aspect, log_forme),
 `[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
 reads and type-converts every value out of the raw `ConfigParser` into plain dicts (`ocr_cfg`,
 `name_cfg`) before using them — if you add a config key, update both `config.py`'s prompts and this
@@ -82,13 +83,22 @@ calibrator (see below) fills them in and writes them back with `_save_calibratio
 add it. The box count is configurable from 2 to 5 (`MIN_BOXES`/`MAX_BOXES` in
 `watcher.py`) via `+`/`−` buttons in the calibrator itself, not a config prompt; existing
 `config.ini` files with only `box1`/`box2` load transparently as a 2-box config.
+`psm`, `o_zero_aspect` and `log_forme` are optional and have no prompt either — they exist so the
+Tesseract page segmentation mode (default `OCR_PSM_DEFAULT`, 6 = single uniform block of text) and
+the O-vs-0 shape threshold (default `O_ZERO_ASPECT_DEFAULT`) can be tuned by hand, and the measured
+ratios logged for that tuning, without a rebuild.
 
 **Processing pipeline** (`_rinomina_pdf`): `pdf2image.convert_from_path` renders page 1 → `PIL` crops
-each of the 2-5 configured boxes → `_preprocess_for_ocr` (grayscale, autocontrast, fixed threshold)
-improves each crop → `pytesseract.image_to_string` OCRs each preprocessed crop → `_pulisci_nome`
-strips non-word characters, truncates to `max_length`, optionally strips leading zeros → the
-non-empty cleaned strings are joined with a single space into the new filename, with `(1)`, `(2)`,
-... appended on collision. Before OCR, `_rinomina_pdf` calibrates the crop boxes via `_calibra_box`
+each of the 2-5 configured boxes → `_preprocess_for_ocr` (grayscale, autocontrast, fixed threshold,
+then a white `OCR_BORDER_PX` border — the official docs recommend padding tightly-cropped text)
+improves each crop → `pytesseract.image_to_string` OCRs each preprocessed crop with
+`_ocr_config(psm)` (`--psm 6`; without it Tesseract defaults to `--psm 3`, full-page layout
+analysis, which is wrong for a small crop and is where character shapes get misclassified) →
+`_rifinisci_o_zero` re-decides every `O`/`o`/`0` from the glyph's measured shape (see below) →
+`_pulisci_nome` strips characters illegal in a
+filename (keeping `&` and `'`, both legal on Windows and common in company names), truncates to
+`max_length`, optionally strips leading zeros → the non-empty cleaned strings are joined with a
+single space into the new filename, with `(1)`, `(2)`, ... appended on collision. Before OCR, `_rinomina_pdf` calibrates the crop boxes via `_calibra_box`
 whenever fewer than `MIN_BOXES` are configured (first PDF ever processed — the calibrator is
 mandatory then, and cancelling skips that file rather than cropping garbage) or whenever
 `show_rects` is `True` in `config.ini` (opt-in recalibration). `_calibra_box(pdf_paths, initial_path,
@@ -117,6 +127,31 @@ page a few millimeters off from where it was during calibration. If the anchor c
 the uncorrected calibrated boxes and logs a warning rather than blocking the file. `config.ini`
 without `anchor_x`/`anchor_y` (calibrated before this existed) simply skips correction — same
 optional-key pattern as `box1..5`/`show_rects`.
+
+**O-vs-0 disambiguation by glyph shape** (`_rifinisci_o_zero`): Tesseract confuses these two on
+scans, and the distinction is geometric rather than linguistic — letter `O` is a near-perfect circle
+(bounding-box width/height around 1.00 in common fonts), digit `0` a narrower oval (≈0.68 in
+Arial/Times, ≈0.81 in monospace). So after `image_to_string`, a second `image_to_boxes` pass over the
+*same* crop yields per-glyph bounding boxes; `_parse_glyph_boxes` turns the `makebox` lines
+(`char left bottom right top page`, bottom-left origin) into `(char, width, height)` and
+`_correggi_o_zero` re-decides each `O`/`o`/`0` against `o_zero_aspect`. When the shape says "letter"
+but Tesseract had read a digit, the case comes from the surrounding word via `_caso_da_contesto`.
+
+Three properties worth preserving if you touch this: (1) genuine digits and genuine letters are both
+left alone — there is no class-wide conversion, which is the explicit requirement here, so a `3` in
+"3M" or an `O` in a document number survives; (2) box output carries no spaces or newlines, so the
+two readings are aligned character by character and **any** desync abandons the correction rather
+than applying a measurement to the wrong glyph; (3) the second pass runs only when the text actually
+contains an ambiguous glyph, and an exception in it keeps the original reading instead of failing
+the file.
+
+**Why not `tessedit_char_whitelist`:** constraining the character set is the other obvious way to fix
+this, and it does not work. The parameter is unreliable with Tesseract 4/5's LSTM engine — it was
+dropped in 4.0 and only partially restored, and the reported failures are worst on character sets
+with diacritics, which is exactly ours (`ita+deu`). It works properly only under `--oem 0`, whose
+model data is not in the `tessdata_fast` files vendored under `vendor/tesseract/tessdata/`. It also
+could not express "this glyph is round, therefore a letter" at all — it can only forbid characters
+wholesale. Don't reach for it without verifying on real scans first.
 
 **Watching**: `CMRHandler` (a `watchdog` `FileSystemEventHandler`) reacts to created/moved/modified
 events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to stop

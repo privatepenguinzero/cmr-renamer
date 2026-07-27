@@ -23,17 +23,21 @@ from watchdog.events import FileSystemEventHandler
 
 from .config import load_or_create_config
 
+# Entrambe le dipendenze sono opzionali e vanno degradate silenziosamente, non solo
+# quando mancano: importare pystray su una macchina senza display avvia la ricerca
+# del backend e solleva un errore Xlib, non un ImportError. Un guard troppo stretto
+# faceva quindi crashare l'intero programma invece di lasciarlo senza tray.
 try:
     from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox
     from PIL import ImageTk
     TKINTER_AVAILABLE = True
-except ImportError:
+except Exception:
     TKINTER_AVAILABLE = False
 
 try:
     import pystray
     PYSTRAY_AVAILABLE = True
-except ImportError:
+except Exception:
     PYSTRAY_AVAILABLE = False
 
 
@@ -172,9 +176,16 @@ def _setup_file_logging(log_dir: str):
 # OCR & rename helpers
 # ──────────────────────────────────────────────────────────────
 
+# Caratteri non alfanumerici mantenuti nel nome file: tutti legali su Windows
+# (i vietati sono \ / : * ? " < > |). La & compare spesso nelle ragioni sociali
+# ("ROSSI & FIGLI"), l'apostrofo nei nomi italiani ("L'OREAL"). Il '-' deve
+# restare ultimo, altrimenti nella classe di caratteri diventa un intervallo.
+_EXTRA_NAME_CHARS = r".&'-"
+
+
 def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     """Pulisce il testo OCR per usarlo come nome file."""
-    clean = re.sub(r'[^\w\s.-]', '', testo).replace('\n', ' ').strip()
+    clean = re.sub(rf'[^\w\s{_EXTRA_NAME_CHARS}]', '', testo).replace('\n', ' ').strip()
     if len(clean) > max_len:
         clean = clean[:max_len]
     if rimuovi_zeri:
@@ -191,15 +202,154 @@ def _render_pdf_page(path: str, dpi: int) -> "Image.Image":
     return immagini[0]
 
 
+# Tesseract, senza --psm esplicito, usa il proprio default 3 (analisi di layout di
+# una pagina intera): sbagliato per un ritaglio di poche centinaia di pixel, ed è
+# la condizione in cui la classificazione dei caratteri perde contesto e confonde
+# le forme simili. 6 = "blocco uniforme di testo": regge sia una riga sola sia una
+# ragione sociale su più righe (7 scarterebbe le righe dopo la prima).
+OCR_PSM_DEFAULT = 6
+
+# Bordo bianco aggiunto attorno a ogni crop prima dell'OCR: la documentazione
+# ufficiale lo raccomanda per il testo tagliato stretto, che è esattamente il caso
+# dei box disegnati col mouse.
+OCR_BORDER_PX = 10
+
+
+def _ocr_config(psm: int) -> str:
+    """Stringa di configurazione da passare a pytesseract."""
+    return f"--psm {int(psm)}"
+
+
 def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
-    """Migliora un crop prima dell'OCR: scala di grigi, contrasto, binarizzazione.
+    """Migliora un crop prima dell'OCR: scala di grigi, contrasto, binarizzazione, bordo bianco.
 
     Soglia fissa (128), non derivata per immagine — punto di partenza pensato
     per tuning manuale (vedi verifica del piano), non un default definitivo.
+    Il bordo si aggiunge dopo la binarizzazione, così da non falsare l'istogramma
+    usato da autocontrast.
     """
     gray = img.convert('L')
     contrasted = ImageOps.autocontrast(gray)
-    return contrasted.point(lambda p: 255 if p > 128 else 0)
+    binaria = contrasted.point(lambda p: 255 if p > 128 else 0)
+    return ImageOps.expand(binaria, border=OCR_BORDER_PX, fill=255)
+
+
+# Discriminazione O/0 sulla forma del glifo. La lettera O è un cerchio quasi
+# perfetto (larghezza/altezza vicino a 1), la cifra 0 è un ovale più stretto: nei
+# font più diffusi, a parità di altezza, 'O' sta intorno a 1.00 e '0' intorno a
+# 0.68 (Arial, Times) o 0.81 (monospazio, il caso più stretto). La soglia sta in
+# mezzo, spostata un po' verso il basso perché preservare una lettera è l'errore
+# meno grave. Il valore giusto dipende dal font del documento: `log_forme = true`
+# in config.ini stampa il rapporto misurato di ogni glifo ambiguo per tararla,
+# e `o_zero_aspect` la sovrascrive senza ricompilare.
+O_ZERO_ASPECT_DEFAULT = 0.80
+
+_GLIFI_O_ZERO = frozenset('Oo0')
+
+
+def _parse_glyph_boxes(raw: str) -> list:
+    """Interpreta l'output `makebox` di Tesseract in una lista di (carattere, larghezza, altezza).
+
+    Ogni riga è `char left bottom right top page` con origine in basso a sinistra.
+    Le righe malformate vengono scartate: l'allineamento a valle se ne accorge.
+    """
+    glifi = []
+    for riga in raw.splitlines():
+        parti = riga.split(' ')
+        if len(parti) < 5 or not parti[0]:
+            continue
+        try:
+            left, bottom, right, top = (int(v) for v in parti[1:5])
+        except ValueError:
+            continue
+        glifi.append((parti[0], right - left, top - bottom))
+    return glifi
+
+
+def _caso_da_contesto(caratteri: list, pos: int) -> str:
+    """'O' o 'o' secondo il caso prevalente delle lettere nella stessa parola."""
+    minuscole = maiuscole = 0
+    for direzione in (-1, 1):
+        i = pos + direzione
+        while 0 <= i < len(caratteri) and not caratteri[i].isspace():
+            if caratteri[i].isalpha():
+                if caratteri[i].islower():
+                    minuscole += 1
+                else:
+                    maiuscole += 1
+            i += direzione
+    return 'o' if minuscole > maiuscole else 'O'
+
+
+def _correggi_o_zero(testo: str, glifi: list, soglia: float, log_forme: bool = False) -> str:
+    """Ridecide ogni glifo O/o/0 del testo in base alla forma misurata sull'immagine.
+
+    `glifi` è la sequenza restituita da `_parse_glyph_boxes`: gli stessi caratteri
+    del testo, nello stesso ordine, ma senza spazi né ritorni a capo. Se le due
+    sequenze non si allineano, la misura non è attribuibile ai caratteri giusti e
+    il testo viene restituito intatto — meglio nessuna correzione che una applicata
+    al glifo sbagliato.
+
+    A differenza di una conversione per classe, qui una cifra che è davvero una
+    cifra e una lettera che è davvero una lettera restano quello che sono.
+    """
+    if not any(c in _GLIFI_O_ZERO for c in testo):
+        return testo
+
+    posizioni = [i for i, c in enumerate(testo) if not c.isspace()]
+    if len(posizioni) != len(glifi):
+        print(f"⚠️ Forme O/0 non verificabili: {len(glifi)} glifi misurati per "
+              f"{len(posizioni)} caratteri riconosciuti. Testo lasciato invariato.")
+        return testo
+
+    disallineati = [
+        testo[pos] for pos, (ch, _, _) in zip(posizioni, glifi)
+        if testo[pos] != ch and not (testo[pos] in _GLIFI_O_ZERO and ch in _GLIFI_O_ZERO)
+    ]
+    if disallineati:
+        print(f"⚠️ Forme O/0 non verificabili: {len(disallineati)} caratteri non "
+              f"corrispondono tra le due letture. Testo lasciato invariato.")
+        return testo
+
+    caratteri = list(testo)
+    for pos, (_, larghezza, altezza) in zip(posizioni, glifi):
+        originale = caratteri[pos]
+        if originale not in _GLIFI_O_ZERO or altezza <= 0:
+            continue
+        rapporto = larghezza / altezza
+        if rapporto >= soglia:
+            # Tondo: è una lettera. Se Tesseract aveva già letto una lettera si
+            # conserva il suo caso, altrimenti lo si deduce dalla parola.
+            deciso = originale if originale.isalpha() else _caso_da_contesto(caratteri, pos)
+        else:
+            deciso = '0'
+        if log_forme:
+            print(f"   forma '{originale}' rapporto {rapporto:.2f} (soglia {soglia:.2f}) → '{deciso}'")
+        elif deciso != originale:
+            print(f"   ↻ '{originale}' → '{deciso}' (rapporto forma {rapporto:.2f})")
+        caratteri[pos] = deciso
+    return ''.join(caratteri)
+
+
+def _rifinisci_o_zero(crop: "Image.Image", testo: str, ocr_cfg: dict) -> str:
+    """Corregge i glifi O/0 di `testo` misurandoli, con una seconda passata di Tesseract.
+
+    La passata extra si fa solo se serve (il testo contiene almeno un glifo
+    ambiguo) e non è mai bloccante: se fallisce si tiene la lettura originale.
+    """
+    if not any(c in _GLIFI_O_ZERO for c in testo):
+        return testo
+    config = _ocr_config(ocr_cfg.get('psm', OCR_PSM_DEFAULT))
+    try:
+        raw = pytesseract.image_to_boxes(crop, lang=ocr_cfg['lang'], config=config)
+    except Exception as e:
+        print(f"⚠️ Impossibile misurare la forma dei glifi O/0: {e}")
+        return testo
+    return _correggi_o_zero(
+        testo, _parse_glyph_boxes(raw),
+        ocr_cfg.get('o_zero_aspect', O_ZERO_ASPECT_DEFAULT),
+        ocr_cfg.get('log_forme', False),
+    )
 
 
 _ANCHOR_DARK_THRESHOLD = 128  # stessa soglia di _preprocess_for_ocr
@@ -213,7 +363,11 @@ def _content_profile(binaria: "Image.Image", axis_size: int, vertical: bool) -> 
         small = binaria.resize((1, axis_size), Image.BOX)
     else:
         small = binaria.resize((axis_size, 1), Image.BOX)
-    return [(255 - p) / 255 for p in small.getdata()]
+    # Image.getdata() è deprecata e verrà rimossa in Pillow 14; get_flattened_data()
+    # è il sostituto ma non esiste nelle versioni più vecchie, e pyproject.toml non
+    # fissa un minimo per pillow — quindi si sceglie a runtime.
+    dati = small.get_flattened_data() if hasattr(small, 'get_flattened_data') else small.getdata()
+    return [(255 - p) / 255 for p in dati]
 
 
 def _find_content_start(profile: list) -> "int | None":
@@ -282,8 +436,12 @@ def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None") -
         config['OCR'][f'box{i}'] = ','.join(str(int(v)) for v in box)
     # Rimuove eventuali chiavi box(N+1).. rimaste da una configurazione precedente
     # con più box (es. da 4 box a 3: box4 va eliminato, non lasciato stantio).
-    for i in range(len(boxes) + 1, MAX_BOXES + 1):
-        config['OCR'].pop(f'box{i}', None)
+    # box{N}_chars veniva scritta da una versione intermedia mai rilasciata: si
+    # rimuove sempre, così un config.ini che l'avesse non resta con chiavi morte.
+    for i in range(1, MAX_BOXES + 1):
+        if i > len(boxes):
+            config['OCR'].pop(f'box{i}', None)
+        config['OCR'].pop(f'box{i}_chars', None)
     if anchor is not None:
         config['OCR']['anchor_x'] = str(int(anchor[0]))
         config['OCR']['anchor_y'] = str(int(anchor[1]))
@@ -348,12 +506,13 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
 
     `pdf_paths` è l'elenco dei PDF della cartella monitorata, selezionabili da una lista laterale
     per confrontare visivamente se i box calibrati si applicano bene a più documenti; il cambio file
-    ridisegna solo l'immagine di sfondo, i box restano nelle stesse coordinate. `initial_path` è il
-    file mostrato all'apertura (preselezionato in lista). `boxes` è una lista di partenza di 2-5
-    tuple (x1,y1,x2,y2). Se l'utente salva, ritorna {'boxes': [...], 'anchor': (x,y) | None} —
-    l'ancora è rilevata sull'immagine visualizzata al momento del salvataggio (non necessariamente
-    quella di `initial_path`, se nel frattempo si è passati a un altro file dalla lista). Ritorna
-    None se l'utente annulla.
+    ridisegna solo l'immagine di sfondo e sposta i box del solo scostamento di deriva rilevato.
+    `initial_path` è il file mostrato all'apertura (preselezionato in lista). `boxes` è una lista di
+    partenza di 2-5 tuple (x1,y1,x2,y2). Se l'utente salva, ritorna
+    {'boxes': [...], 'anchor': (x,y) | None} — l'ancora è rilevata
+    sull'immagine visualizzata al momento del salvataggio (non necessariamente quella di
+    `initial_path`, se nel frattempo si è passati a un altro file dalla lista). Ritorna None se
+    l'utente annulla.
     """
     if not TKINTER_AVAILABLE:
         print("⚠️ tkinter non disponibile: calibrazione box saltata.")
@@ -639,7 +798,10 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
         btn_frame.pack(pady=8)
 
         def on_save():
-            state['result'] = {'boxes': list(state['boxes']), 'anchor': _detect_content_anchor(state['img'])}
+            state['result'] = {
+                'boxes': list(state['boxes']),
+                'anchor': _detect_content_anchor(state['img']),
+            }
             root.destroy()
 
         def on_cancel():
@@ -786,9 +948,13 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     _calibration_lock.release()
 
         parti = []
+        psm = ocr_cfg.get('psm', OCR_PSM_DEFAULT)
         for box in _resolve_crop_boxes(img, ocr_cfg):
             crop = _preprocess_for_ocr(img.crop(box))
-            testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'])
+            testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'], config=_ocr_config(psm))
+            # Va fatto sul testo grezzo, prima che _pulisci_nome tronchi a
+            # max_length o rimuova gli zeri iniziali.
+            testo = _rifinisci_o_zero(crop, testo, ocr_cfg)
             pulito = _pulisci_nome(testo, name_cfg['max_length'], name_cfg['remove_leading_zeros'])
             if pulito:
                 parti.append(pulito)
@@ -932,12 +1098,19 @@ def run() -> int:
     # count and coordinates are selected with the mouse on the first PDF
     # processed, not prompted for at setup time); show_rects likewise has no
     # setup prompt and only takes effect if a user hand-edits config.ini.
+    # psm, o_zero_aspect and log_forme have no prompt either: they exist so the
+    # segmentation mode and the O/0 shape threshold can be tuned by hand, and the
+    # measured ratios logged for that tuning, without a rebuild.
+    boxes = _load_boxes_from_config(cfg['OCR'])
     ocr_cfg = {
-        'boxes': _load_boxes_from_config(cfg['OCR']),
+        'boxes': boxes,
         'anchor': _load_anchor_from_config(cfg['OCR']),
         'show_rects': cfg['OCR'].getboolean('show_rects', fallback=False),
         'lang': cfg['OCR']['lang'],
         'dpi': int(cfg['OCR']['dpi']),
+        'psm': cfg['OCR'].getint('psm', fallback=OCR_PSM_DEFAULT),
+        'o_zero_aspect': cfg['OCR'].getfloat('o_zero_aspect', fallback=O_ZERO_ASPECT_DEFAULT),
+        'log_forme': cfg['OCR'].getboolean('log_forme', fallback=False),
     }
 
     name_cfg = {
