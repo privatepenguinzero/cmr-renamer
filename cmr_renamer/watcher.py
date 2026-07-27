@@ -327,8 +327,8 @@ MAX_BOXES = 5
 _calibration_lock = threading.Lock()
 
 
-def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None") -> None:
-    """Salva le coordinate di tutti i box (2-5) e l'ancora di contenuto nel config.ini esistente."""
+def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None", char_modes: list) -> None:
+    """Salva coordinate dei box (2-5), tipo di carattere per box e ancora di contenuto nel config.ini esistente."""
     config_path = os.path.join(_get_config_dir(), 'config.ini')
     config = configparser.ConfigParser()
     config.read(config_path)
@@ -336,10 +336,13 @@ def _save_calibration_to_config(boxes: list, anchor: "tuple[int, int] | None") -
         config['OCR'] = {}
     for i, box in enumerate(boxes, start=1):
         config['OCR'][f'box{i}'] = ','.join(str(int(v)) for v in box)
+    for i, modo in enumerate(char_modes[:len(boxes)], start=1):
+        config['OCR'][f'box{i}_chars'] = modo
     # Rimuove eventuali chiavi box(N+1).. rimaste da una configurazione precedente
     # con più box (es. da 4 box a 3: box4 va eliminato, non lasciato stantio).
     for i in range(len(boxes) + 1, MAX_BOXES + 1):
         config['OCR'].pop(f'box{i}', None)
+        config['OCR'].pop(f'box{i}_chars', None)
     if anchor is not None:
         config['OCR']['anchor_x'] = str(int(anchor[0]))
         config['OCR']['anchor_y'] = str(int(anchor[1]))
@@ -363,6 +366,20 @@ def _load_boxes_from_config(ocr_section) -> list:
             break
         boxes.append(tuple(map(int, raw.split(','))))
     return boxes
+
+
+def _load_char_modes_from_config(ocr_section, n_boxes: int) -> list:
+    """Legge box1_chars..box5_chars, riempiendo con `misto` ciò che manca o non è valido.
+
+    Ritorna sempre esattamente `n_boxes` elementi: i config.ini creati prima che
+    questa opzione esistesse non hanno nessuna di queste chiavi e devono comportarsi
+    come oggi, cioè senza correzione.
+    """
+    modes = []
+    for i in range(1, n_boxes + 1):
+        raw = (ocr_section.get(f'box{i}_chars') or '').strip().lower()
+        modes.append(raw if raw in CHAR_MODES else CHAR_MODE_MISTO)
+    return modes
 
 
 def _load_anchor_from_config(ocr_section) -> "tuple[int, int] | None":
