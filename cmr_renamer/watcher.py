@@ -23,17 +23,21 @@ from watchdog.events import FileSystemEventHandler
 
 from .config import load_or_create_config
 
+# Entrambe le dipendenze sono opzionali e vanno degradate silenziosamente, non solo
+# quando mancano: importare pystray su una macchina senza display avvia la ricerca
+# del backend e solleva un errore Xlib, non un ImportError. Un guard troppo stretto
+# faceva quindi crashare l'intero programma invece di lasciarlo senza tray.
 try:
-    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox, Radiobutton, StringVar
+    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox
     from PIL import ImageTk
     TKINTER_AVAILABLE = True
-except ImportError:
+except Exception:
     TKINTER_AVAILABLE = False
 
 try:
     import pystray
     PYSTRAY_AVAILABLE = True
-except ImportError:
+except Exception:
     PYSTRAY_AVAILABLE = False
 
 
@@ -290,7 +294,11 @@ def _content_profile(binaria: "Image.Image", axis_size: int, vertical: bool) -> 
         small = binaria.resize((1, axis_size), Image.BOX)
     else:
         small = binaria.resize((axis_size, 1), Image.BOX)
-    return [(255 - p) / 255 for p in small.getdata()]
+    # Image.getdata() è deprecata e verrà rimossa in Pillow 14; get_flattened_data()
+    # è il sostituto ma non esiste nelle versioni più vecchie, e pyproject.toml non
+    # fissa un minimo per pillow — quindi si sceglie a runtime.
+    dati = small.get_flattened_data() if hasattr(small, 'get_flattened_data') else small.getdata()
+    return [(255 - p) / 255 for p in dati]
 
 
 def _find_content_start(profile: list) -> "int | None":
