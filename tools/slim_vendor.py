@@ -163,7 +163,10 @@ def slim(apply: bool) -> int:
                 os.remove(os.path.join(bin_dir, f))
             for f in keep:
                 p = os.path.join(bin_dir, f)
-                if f.lower().endswith(('.dll', '.exe')):
+                # Only rewrite a binary that actually carries debug sections:
+                # objcopy would otherwise produce a byte-different file with no
+                # size gain, and every one of these is a Git LFS object.
+                if f.lower().endswith(('.dll', '.exe')) and _debug_bytes(p) > 0:
                     tmp = p + '.stripped'
                     subprocess.run(['objcopy', '--strip-debug', p, tmp], check=True)
                     shutil.move(tmp, p)
