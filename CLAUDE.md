@@ -67,8 +67,8 @@ positive integers (`_parse_positive_int`) and requiring at least one language be
 Falls back to the original per-field console prompts if `tkinter` is unavailable or the form is
 closed without saving.
 Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1..box5 crop coordinates
-for 2-5 boxes, box1_chars..box5_chars per-box expected content type, anchor_x/anchor_y
-content-anchor reference, show_rects debug flag, lang, dpi, psm),
+for 2-5 boxes, anchor_x/anchor_y content-anchor reference, show_rects debug flag, lang, dpi, psm,
+o_zero_aspect, log_forme),
 `[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
 reads and type-converts every value out of the raw `ConfigParser` into plain dicts (`ocr_cfg`,
 `name_cfg`) before using them — if you add a config key, update both `config.py`'s prompts and this
@@ -83,11 +83,10 @@ calibrator (see below) fills them in and writes them back with `_save_calibratio
 add it. The box count is configurable from 2 to 5 (`MIN_BOXES`/`MAX_BOXES` in
 `watcher.py`) via `+`/`−` buttons in the calibrator itself, not a config prompt; existing
 `config.ini` files with only `box1`/`box2` load transparently as a 2-box config.
-`box1_chars`..`box5_chars` follow the same optional-key pattern and are written by the calibrator
-alongside the boxes: each holds `misto` (default, no correction), `testo`, or `numeri`, declaring
-what a box is expected to contain. `psm` is optional too and has no prompt — it only exists so the
-Tesseract page segmentation mode can be tuned by hand without a rebuild (default `OCR_PSM_DEFAULT`,
-6 = single uniform block of text).
+`psm`, `o_zero_aspect` and `log_forme` are optional and have no prompt either — they exist so the
+Tesseract page segmentation mode (default `OCR_PSM_DEFAULT`, 6 = single uniform block of text) and
+the O-vs-0 shape threshold (default `O_ZERO_ASPECT_DEFAULT`) can be tuned by hand, and the measured
+ratios logged for that tuning, without a rebuild.
 
 **Processing pipeline** (`_rinomina_pdf`): `pdf2image.convert_from_path` renders page 1 → `PIL` crops
 each of the 2-5 configured boxes → `_preprocess_for_ocr` (grayscale, autocontrast, fixed threshold,
@@ -95,15 +94,15 @@ then a white `OCR_BORDER_PX` border — the official docs recommend padding tigh
 improves each crop → `pytesseract.image_to_string` OCRs each preprocessed crop with
 `_ocr_config(psm)` (`--psm 6`; without it Tesseract defaults to `--psm 3`, full-page layout
 analysis, which is wrong for a small crop and is where character shapes get misclassified) →
-`_correggi_confusioni` maps confusable pairs (`0`↔`O`, `1`↔`I`, `2`↔`Z`, `5`↔`S`, `6`↔`G`, `8`↔`B`)
-according to that box's `box{N}_chars` mode → `_pulisci_nome` strips characters illegal in a
+`_rifinisci_o_zero` re-decides every `O`/`o`/`0` from the glyph's measured shape (see below) →
+`_pulisci_nome` strips characters illegal in a
 filename (keeping `&` and `'`, both legal on Windows and common in company names), truncates to
 `max_length`, optionally strips leading zeros → the non-empty cleaned strings are joined with a
 single space into the new filename, with `(1)`, `(2)`, ... appended on collision. Before OCR, `_rinomina_pdf` calibrates the crop boxes via `_calibra_box`
 whenever fewer than `MIN_BOXES` are configured (first PDF ever processed — the calibrator is
 mandatory then, and cancelling skips that file rather than cropping garbage) or whenever
 `show_rects` is `True` in `config.ini` (opt-in recalibration). `_calibra_box(pdf_paths, initial_path,
-boxes, char_modes, dpi)` opens a Tk window with the rendered page on a scrollable/zoomable `Canvas` (mouse wheel
+boxes, dpi)` opens a Tk window with the rendered page on a scrollable/zoomable `Canvas` (mouse wheel
 or +/− buttons, scaled around a `base_scale` fit-to-screen and clamped by `MAX_ZOOM`/`MAX_DIM`),
 plus a sidebar `Listbox` of every PDF in the watched folder (`_list_watched_pdfs`, sorted
 alphabetically, `initial_path` preselected) so box placement can be checked live against multiple
@@ -116,10 +115,7 @@ correction — dragging on a non-reference file un-shifts the dropped position b
 the saved coordinate stays correct regardless of which file was on screen while dragging.
 Colored, numbered selector buttons (one per box, colors match the drawn rectangles) pick which box
 the next drag updates, plus `+ Box`/`− Box` buttons (disabled at 5/2 respectively) to change the box
-count, plus a "Contenuto:" radio group (`Misto`/`Testo`/`Numeri`) that sets the *active* box's
-`box{N}_chars` mode — `set_active` mirrors the stored mode back into the shared `StringVar` behind a
-`state['syncing']` guard, without which that sync would immediately be written back onto the newly
-selected box; saving computes a *content anchor* via `_detect_content_anchor` (where the page's content
+count; saving computes a *content anchor* via `_detect_content_anchor` (where the page's content
 stops being white, from the top and from the left — a fast Pillow-only row/column darkness scan,
 no numpy/OpenCV) on whichever page is on screen at that moment, and persists both the box list and
 that anchor to `config.ini` via `_save_calibration_to_config`, applying them immediately to
@@ -132,13 +128,30 @@ the uncorrected calibrated boxes and logs a warning rather than blocking the fil
 without `anchor_x`/`anchor_y` (calibrated before this existed) simply skips correction — same
 optional-key pattern as `box1..5`/`show_rects`.
 
-**Why not `tessedit_char_whitelist`:** constraining the character set is the obvious way to fix
-`O`/`0` confusion, but the parameter is unreliable with Tesseract 4/5's LSTM engine — it was
+**O-vs-0 disambiguation by glyph shape** (`_rifinisci_o_zero`): Tesseract confuses these two on
+scans, and the distinction is geometric rather than linguistic — letter `O` is a near-perfect circle
+(bounding-box width/height around 1.00 in common fonts), digit `0` a narrower oval (≈0.68 in
+Arial/Times, ≈0.81 in monospace). So after `image_to_string`, a second `image_to_boxes` pass over the
+*same* crop yields per-glyph bounding boxes; `_parse_glyph_boxes` turns the `makebox` lines
+(`char left bottom right top page`, bottom-left origin) into `(char, width, height)` and
+`_correggi_o_zero` re-decides each `O`/`o`/`0` against `o_zero_aspect`. When the shape says "letter"
+but Tesseract had read a digit, the case comes from the surrounding word via `_caso_da_contesto`.
+
+Three properties worth preserving if you touch this: (1) genuine digits and genuine letters are both
+left alone — there is no class-wide conversion, which is the explicit requirement here, so a `3` in
+"3M" or an `O` in a document number survives; (2) box output carries no spaces or newlines, so the
+two readings are aligned character by character and **any** desync abandons the correction rather
+than applying a measurement to the wrong glyph; (3) the second pass runs only when the text actually
+contains an ambiguous glyph, and an exception in it keeps the original reading instead of failing
+the file.
+
+**Why not `tessedit_char_whitelist`:** constraining the character set is the other obvious way to fix
+this, and it does not work. The parameter is unreliable with Tesseract 4/5's LSTM engine — it was
 dropped in 4.0 and only partially restored, and the reported failures are worst on character sets
 with diacritics, which is exactly ours (`ita+deu`). It works properly only under `--oem 0`, whose
-model data is not in the `tessdata_fast` files vendored under `vendor/tesseract/tessdata/`. The
-post-OCR correction in `_correggi_confusioni` is engine-independent, deterministic, and testable
-without the Tesseract binary. Don't replace it with a whitelist without verifying on real scans first.
+model data is not in the `tessdata_fast` files vendored under `vendor/tesseract/tessdata/`. It also
+could not express "this glyph is round, therefore a letter" at all — it can only forbid characters
+wholesale. Don't reach for it without verifying on real scans first.
 
 **Watching**: `CMRHandler` (a `watchdog` `FileSystemEventHandler`) reacts to created/moved/modified
 events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to stop

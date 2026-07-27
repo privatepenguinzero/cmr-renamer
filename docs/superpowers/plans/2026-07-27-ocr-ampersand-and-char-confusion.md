@@ -2,6 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> ⚠️ **Task 2, 3 e 5 sono stati superati durante l'esecuzione.** Il tipo di carattere per box
+> (`misto`/`testo`/`numeri`, chiavi `box{N}_chars`, radio nel calibratore) converte *tutti* i glifi
+> di un box a una classe, quindi riscriveva anche una cifra legittima in una ragione sociale o una
+> lettera legittima in un numero documento. Su indicazione dell'utente — "voglio mantenere numeri
+> quando sono numeri e testo quando è testo, non voglio conversioni" — è stato rimosso e sostituito
+> dalla **discriminazione per forma del glifo** (`_rifinisci_o_zero`): la lettera `O` è un cerchio
+> quasi perfetto, la cifra `0` un ovale più stretto, e il rapporto larghezza/altezza misurato da una
+> seconda passata `image_to_boxes` li separa senza convertire nulla per classe. Vedi la sezione
+> "Revisione: discriminazione per forma" in fondo. Task 1, 4, 6 (parte `psm`) e 7 restano validi.
+
 **Goal:** Far sì che la `&` (e l'apostrofo) sopravvivano fino al nome del file, e che le lettere `O` non vengano più scritte come `0` (né viceversa) nei nomi generati dall'OCR.
 
 **Architecture:** Tre interventi indipendenti su `cmr_renamer/watcher.py`. (1) La whitelist di `_pulisci_nome` viene allargata a `&` e `'`, entrambi legali nei nomi file Windows. (2) La chiamata a Tesseract passa da segmentazione automatica di pagina (`--psm 3`, il default implicito che pytesseract non sovrascrive) a `--psm 6` "blocco uniforme di testo", che è la modalità corretta per un ritaglio, e ogni crop riceve un bordo bianco prima dell'OCR — entrambe raccomandazioni della documentazione ufficiale per regioni ritagliate strette. (3) Ogni box acquisisce un *tipo di carattere* (`misto`/`testo`/`numeri`) scelto nel calibratore e persistito in `config.ini`, che applica una correzione deterministica post-OCR delle coppie confondibili.
@@ -929,15 +939,26 @@ git commit -m "Document per-box character mode, psm, and the whitelist rationale
 
 **Contesto:** questo ambiente non ha `tkinter` né un binario Tesseract eseguibile, quindi tutto ciò che segue **non è stato verificato** dall'implementazione automatica e va provato sulla macchina reale prima di considerare chiusi i due bug. Nessuna di queste voci va spuntata sulla base dei test automatici dei task 1-6.
 
-- [ ] Aprire il calibratore (tray → "Ricalibra box") e verificare che compaia il gruppo "Contenuto:" con i tre radio `Misto` / `Testo` / `Numeri`.
-- [ ] Selezionare il box 1, impostare `Numeri`; selezionare il box 2, impostare `Testo`; tornare sul box 1 e verificare che i radio mostrino ancora `Numeri` (cioè che `set_active` sincronizzi senza sovrascrivere).
-- [ ] Aggiungere un box con `+ Box`, verificare che parta da `Misto`; rimuoverlo con `− Box` e verificare che i tipi dei box rimanenti non scivolino di posizione.
-- [ ] Salvare e controllare che `config.ini` contenga `box1_chars = numeri` e `box2_chars = testo`.
+**Il punto più importante, da fare per primo.** L'allineamento tra `image_to_string` e
+`image_to_boxes` è l'unica assunzione non verificabile in sandbox: se le due letture divergono
+sistematicamente, la correzione non si applica mai *in silenzio* — a parte l'avviso nel log.
+
+- [ ] Mettere `log_forme = true` sotto `[OCR]` in `config.ini`, far elaborare un CMR reale e leggere
+      `cmr-renamer.log`. Se compare `⚠️ Forme O/0 non verificabili`, l'allineamento non tiene e va
+      indagato prima di tutto il resto. Se compaiono righe `forma '...' rapporto N.NN`, funziona.
+- [ ] Dalle righe `rapporto` annotare i valori dei glifi che *sai* essere lettere e di quelli che
+      *sai* essere cifre. Devono formare due gruppi separati. Se la soglia di default (0.80) non cade
+      in mezzo, scrivere il valore giusto in `o_zero_aspect` — nessuna ricompilazione necessaria.
+- [ ] Far elaborare un CMR con una `O` che prima veniva letta `0`: il nome deve ora contenere `O`.
+- [ ] Verificare il caso opposto: un numero documento con uno `0` vero deve restare `0`, non diventare `O`.
+- [ ] Verificare che una ragione sociale con una cifra legittima (tipo "3M") non venga alterata.
+- [ ] Rimettere `log_forme = false` (o togliere la chiave) a taratura finita: con `true` il log
+      cresce di una riga per ogni glifo ambiguo di ogni documento.
 - [ ] Far elaborare un CMR reale che contiene una `&` nella ragione sociale: il file rinominato deve contenere la `&`.
-- [ ] Far elaborare un CMR reale con una `O` che prima veniva letta `0`: il nome deve ora contenere `O`.
-- [ ] Verificare che il numero documento (box `Numeri`) non abbia acquisito lettere spurie.
 - [ ] Confrontare la qualità complessiva dell'OCR con la beta precedente: `--psm 6` e il bordo bianco dovrebbero aver ridotto anche altri errori. Se invece qualche campo peggiora, provare `psm = 7` in `config.ini` (riga singola) prima di toccare il codice.
-- [ ] Verificare che un `config.ini` di v3.1.0b3 (senza `box{N}_chars` né `psm`) venga caricato senza errori e rinomini come prima, a parte le migliorie di psm/bordo.
+- [ ] Verificare che un `config.ini` di v3.1.0b3 (senza `psm`/`o_zero_aspect`/`log_forme`) venga caricato senza errori.
+- [ ] Verificare che il calibratore si apra ancora correttamente (tray → "Ricalibra box"): la sua UI è tornata quella di v3.1.0b3, senza i radio del tipo di contenuto.
+- [ ] Controllare il tempo di elaborazione per file: la seconda passata Tesseract raddoppia le invocazioni sui box che contengono glifi ambigui. Su crop piccoli dovrebbe essere trascurabile, ma va confermato sul volume reale.
 
 ---
 
@@ -954,3 +975,66 @@ git commit -m "Document per-box character mode, psm, and the whitelist rationale
 **3. Coerenza dei tipi** — `char_modes` è ovunque una `list[str]` con valori in `CHAR_MODES`; `_calibra_box` la riceve in quarta posizione e la restituisce sotto la chiave `'char_modes'`, usata identica in `_rinomina_pdf` e nel tray; `_save_calibration_to_config` la prende come terzo parametro in entrambi i call site; `_ocr_config(psm)` è usata solo in `_rinomina_pdf`, con `psm` letto da `ocr_cfg`.
 
 **Rischio noto:** in modo `testo` una cifra legittima all'interno della ragione sociale (es. "3M", "Gruppo 24 ORE") verrebbe convertita in lettera. È il contratto voluto — dichiarare un box come `testo` significa affermare che non contiene cifre — e `misto` resta il default per chi non vuole questa semantica. Da segnalare all'utente al momento della consegna.
+
+---
+
+## Revisione: discriminazione per forma (sostituisce Task 2, 3, 5)
+
+**Perché il tipo per box è stato rimosso.** Applicava una mappa a *ogni* carattere del box, quindi
+in modo `testo` un "3M" diventava "BM" e in modo `numeri` una `S` diventava `5`. Il rischio era
+segnalato nel Self-Review originale come "contratto voluto", ma l'utente ha chiarito il requisito:
+le cifre devono restare cifre e le lettere lettere, senza conversioni di classe.
+
+**Come funziona la sostituzione.** La distinzione `O`/`0` è geometrica, non linguistica: a parità di
+altezza la lettera `O` ha rapporto larghezza/altezza ≈ 1.00, la cifra `0` ≈ 0.68 (Arial, Times) o
+≈ 0.81 nel caso più stretto (monospazio). Dopo `image_to_string` si fa una seconda passata
+`image_to_boxes` **sullo stesso crop e con lo stesso `--psm`**, che restituisce il bounding box di
+ogni glifo; il rapporto misurato decide, glifo per glifo, se è una lettera o una cifra.
+
+| Funzione | Ruolo |
+|---|---|
+| `_parse_glyph_boxes(raw)` | righe `makebox` (`char left bottom right top page`, origine in basso a sinistra) → `[(char, larghezza, altezza)]`; scarta righe malformate |
+| `_caso_da_contesto(caratteri, pos)` | `'O'` o `'o'` secondo il caso prevalente delle lettere nella stessa parola, quando Tesseract aveva letto una cifra e la forma dice "lettera" |
+| `_correggi_o_zero(testo, glifi, soglia, log_forme)` | allinea le due letture e ridecide ogni `O`/`o`/`0` |
+| `_rifinisci_o_zero(crop, testo, ocr_cfg)` | orchestra: salta la seconda passata se non serve, la protegge da eccezioni |
+
+**Le tre proprietà da non perdere in un refactor:**
+
+1. **Nessuna conversione di classe.** Solo i glifi già letti come `O`/`o`/`0` vengono riconsiderati;
+   tutto il resto passa intatto. Un `3` resta `3`.
+2. **Il disallineamento abbandona la correzione.** L'output box non contiene spazi né newline, quindi
+   l'allineamento è posizionale sui soli caratteri non-spazio. Se il numero di glifi non combacia, o
+   se un carattere differisce senza che entrambi siano ambigui, si restituisce il testo invariato con
+   un avviso. Applicare una misura al glifo sbagliato sarebbe peggio di non correggere.
+3. **Mai bloccante.** La seconda passata parte solo se il testo contiene almeno un glifo ambiguo, e
+   una sua eccezione lascia la lettura originale invece di far fallire il file.
+
+**Chiavi di config aggiunte** (opzionali, senza prompt, pattern `show_rects`): `o_zero_aspect`
+(default `O_ZERO_ASPECT_DEFAULT = 0.80`) e `log_forme` (default `false`).
+
+**Sulla soglia 0.80:** è derivata dalle metriche dei font, non misurata su scansioni reali — qui non
+è eseguibile alcun Tesseract. È scelta appena sotto il punto medio (≈0.84) perché preservare una
+lettera è l'errore meno grave dei due. `log_forme = true` esiste proprio per tararla sul font reale
+dei CMR: vedi le prime voci del Task 8.
+
+### Test automatici della revisione
+
+`$SCRATCH/test_o_zero.py` — 15 asserzioni: parsing (incluse righe malformate), `0` tondo → `O`,
+`O` ovale → `0`, cifre e lettere vere che convivono senza alterarsi, caso minuscolo dedotto dalla
+parola, `o` minuscola non maiuscolizzata, testo senza glifi ambigui intatto, disallineamento per
+lunghezza e per carattere, altezza zero (nessuna divisione per zero), soglia rispettata ai due lati.
+
+`$SCRATCH/test_pipeline.py` — end-to-end: `--psm 6` passato a *entrambe* le passate,
+`0O123` + `C00P 3M` → `00123 COOP 3M.pdf` (cifre preservate, lettere corrette, `3M` intatto),
+retrocompatibilità del `config.ini` v3.1.0b3 dal percorso reale di `run()`, e una
+`image_to_boxes` che solleva che non impedisce la rinomina.
+
+## Revisione: due fix minori
+
+- **Guard delle dipendenze opzionali.** `except ImportError` attorno a `pystray`/`tkinter` non
+  intercettava il caso reale: importare `pystray` su una macchina senza display avvia la ricerca del
+  backend e solleva `Xlib.error.DisplayNameError`, facendo crashare l'intero programma invece di
+  lasciarlo senza tray. Ora entrambi catturano `Exception`.
+- **`Image.getdata()` deprecata**, in rimozione in Pillow 14. `_content_profile` usa
+  `get_flattened_data()` quando esiste, con fallback via `hasattr` così `pyproject.toml` non deve
+  fissare un minimo per pillow.
