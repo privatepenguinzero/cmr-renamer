@@ -189,6 +189,55 @@ def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     return clean
 
 
+# Tipo di carattere atteso in un box, scelto nel calibratore e salvato in config.ini.
+# Serve a disambiguare le coppie che Tesseract confonde quando manca il contesto
+# linguistico (O/0, I/1, S/5...). tessedit_char_whitelist non è utilizzabile allo
+# scopo: col motore LSTM di Tesseract 4/5 viene ignorato o degrada il risultato,
+# in particolare sui set con accentate — e i tessdata_fast che imbarchiamo non
+# contengono i dati del motore legacy dove funzionerebbe.
+CHAR_MODE_MISTO = "misto"
+CHAR_MODE_TESTO = "testo"
+CHAR_MODE_NUMERI = "numeri"
+CHAR_MODES = (CHAR_MODE_MISTO, CHAR_MODE_TESTO, CHAR_MODE_NUMERI)
+
+CHAR_MODE_LABELS = {
+    CHAR_MODE_MISTO: "Misto",
+    CHAR_MODE_TESTO: "Testo",
+    CHAR_MODE_NUMERI: "Numeri",
+}
+
+# Cifre che Tesseract produce al posto della lettera corrispondente.
+_CONFUSIONI_VERSO_LETTERA = {
+    '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '6': 'G', '8': 'B',
+}
+
+# Lettere che Tesseract produce al posto della cifra corrispondente. Volutamente
+# conservativa: T/7, A/4, q/9 causerebbero più falsi positivi che correzioni.
+_CONFUSIONI_VERSO_CIFRA = {
+    'O': '0', 'o': '0', 'D': '0',
+    'I': '1', 'l': '1', 'i': '1',
+    'Z': '2', 'z': '2',
+    'S': '5', 's': '5',
+    'G': '6', 'g': '6',
+    'B': '8',
+}
+
+
+def _correggi_confusioni(testo: str, modo: str) -> str:
+    """Corregge le coppie di caratteri confondibili in base al tipo dichiarato del box.
+
+    `misto` (default) non tocca nulla. Un modo sconosciuto — es. config.ini
+    modificato a mano — viene trattato come `misto` anziché sollevare.
+    """
+    if modo == CHAR_MODE_TESTO:
+        mappa = _CONFUSIONI_VERSO_LETTERA
+    elif modo == CHAR_MODE_NUMERI:
+        mappa = _CONFUSIONI_VERSO_CIFRA
+    else:
+        return testo
+    return ''.join(mappa.get(c, c) for c in testo)
+
+
 def _render_pdf_page(path: str, dpi: int) -> "Image.Image":
     """Renderizza la pagina 1 di un PDF come immagine PIL."""
     immagini = convert_from_path(
