@@ -247,15 +247,36 @@ def _render_pdf_page(path: str, dpi: int) -> "Image.Image":
     return immagini[0]
 
 
+# Tesseract, senza --psm esplicito, usa il proprio default 3 (analisi di layout di
+# una pagina intera): sbagliato per un ritaglio di poche centinaia di pixel, ed è
+# la condizione in cui la classificazione dei caratteri perde contesto e confonde
+# le forme simili. 6 = "blocco uniforme di testo": regge sia una riga sola sia una
+# ragione sociale su più righe (7 scarterebbe le righe dopo la prima).
+OCR_PSM_DEFAULT = 6
+
+# Bordo bianco aggiunto attorno a ogni crop prima dell'OCR: la documentazione
+# ufficiale lo raccomanda per il testo tagliato stretto, che è esattamente il caso
+# dei box disegnati col mouse.
+OCR_BORDER_PX = 10
+
+
+def _ocr_config(psm: int) -> str:
+    """Stringa di configurazione da passare a pytesseract."""
+    return f"--psm {int(psm)}"
+
+
 def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
-    """Migliora un crop prima dell'OCR: scala di grigi, contrasto, binarizzazione.
+    """Migliora un crop prima dell'OCR: scala di grigi, contrasto, binarizzazione, bordo bianco.
 
     Soglia fissa (128), non derivata per immagine — punto di partenza pensato
     per tuning manuale (vedi verifica del piano), non un default definitivo.
+    Il bordo si aggiunge dopo la binarizzazione, così da non falsare l'istogramma
+    usato da autocontrast.
     """
     gray = img.convert('L')
     contrasted = ImageOps.autocontrast(gray)
-    return contrasted.point(lambda p: 255 if p > 128 else 0)
+    binaria = contrasted.point(lambda p: 255 if p > 128 else 0)
+    return ImageOps.expand(binaria, border=OCR_BORDER_PX, fill=255)
 
 
 _ANCHOR_DARK_THRESHOLD = 128  # stessa soglia di _preprocess_for_ocr
