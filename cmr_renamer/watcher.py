@@ -812,13 +812,17 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, log_path: str,
                 print("⚠️ Nessun PDF trovato nella cartella monitorata.")
                 return
             boxes_seed = list(ocr_cfg['boxes'])
+            modes_seed = list(ocr_cfg.get('char_modes', []))
             while len(boxes_seed) < MIN_BOXES:
                 boxes_seed.append(_default_box(len(boxes_seed)))
-            risultato = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, ocr_cfg['dpi'])
+            while len(modes_seed) < len(boxes_seed):
+                modes_seed.append(CHAR_MODE_MISTO)
+            risultato = _calibra_box(pdf_paths, pdf_paths[0], boxes_seed, modes_seed, ocr_cfg['dpi'])
             if risultato:
                 ocr_cfg['boxes'] = risultato['boxes']
+                ocr_cfg['char_modes'] = risultato['char_modes']
                 ocr_cfg['anchor'] = risultato['anchor']
-                _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'])
+                _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'], ocr_cfg['char_modes'])
                 print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
         except Exception as e:
             print(f"⚠️ Errore durante la ricalibrazione: {e}")
@@ -900,14 +904,18 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     if serve_calibrazione:
                         print("🖱️ Box OCR non ancora configurati: selezionali con il mouse.")
                     boxes_seed = list(ocr_cfg['boxes'])
+                    modes_seed = list(ocr_cfg.get('char_modes', []))
                     while len(boxes_seed) < MIN_BOXES:
                         boxes_seed.append(_default_box(len(boxes_seed)))
+                    while len(modes_seed) < len(boxes_seed):
+                        modes_seed.append(CHAR_MODE_MISTO)
                     pdf_paths = _list_watched_pdfs(os.path.dirname(pdf_path))
-                    risultato = _calibra_box(pdf_paths, pdf_path, boxes_seed, ocr_cfg['dpi'])
+                    risultato = _calibra_box(pdf_paths, pdf_path, boxes_seed, modes_seed, ocr_cfg['dpi'])
                     if risultato:
                         ocr_cfg['boxes'] = risultato['boxes']
+                        ocr_cfg['char_modes'] = risultato['char_modes']
                         ocr_cfg['anchor'] = risultato['anchor']
-                        _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'])
+                        _save_calibration_to_config(ocr_cfg['boxes'], ocr_cfg['anchor'], ocr_cfg['char_modes'])
                         print(f"✅ Nuove coordinate salvate → {ocr_cfg['boxes']}")
                     elif serve_calibrazione:
                         print(f"⚠️ Calibrazione annullata: '{os.path.basename(pdf_path)}' non elaborato (nessun box configurato).")
@@ -916,9 +924,15 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
                     _calibration_lock.release()
 
         parti = []
-        for box in _resolve_crop_boxes(img, ocr_cfg):
+        modes = ocr_cfg.get('char_modes', [])
+        psm = ocr_cfg.get('psm', OCR_PSM_DEFAULT)
+        for i, box in enumerate(_resolve_crop_boxes(img, ocr_cfg)):
             crop = _preprocess_for_ocr(img.crop(box))
-            testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'])
+            testo = pytesseract.image_to_string(crop, lang=ocr_cfg['lang'], config=_ocr_config(psm))
+            # La correzione va applicata al testo grezzo, prima che _pulisci_nome
+            # tronchi a max_length o rimuova gli zeri iniziali.
+            modo = modes[i] if i < len(modes) else CHAR_MODE_MISTO
+            testo = _correggi_confusioni(testo, modo)
             pulito = _pulisci_nome(testo, name_cfg['max_length'], name_cfg['remove_leading_zeros'])
             if pulito:
                 parti.append(pulito)
@@ -1062,12 +1076,17 @@ def run() -> int:
     # count and coordinates are selected with the mouse on the first PDF
     # processed, not prompted for at setup time); show_rects likewise has no
     # setup prompt and only takes effect if a user hand-edits config.ini.
+    # box{N}_chars is written by the calibrator; psm has no prompt either and
+    # exists to allow tuning the segmentation mode without a rebuild.
+    boxes = _load_boxes_from_config(cfg['OCR'])
     ocr_cfg = {
-        'boxes': _load_boxes_from_config(cfg['OCR']),
+        'boxes': boxes,
+        'char_modes': _load_char_modes_from_config(cfg['OCR'], len(boxes)),
         'anchor': _load_anchor_from_config(cfg['OCR']),
         'show_rects': cfg['OCR'].getboolean('show_rects', fallback=False),
         'lang': cfg['OCR']['lang'],
         'dpi': int(cfg['OCR']['dpi']),
+        'psm': cfg['OCR'].getint('psm', fallback=OCR_PSM_DEFAULT),
     }
 
     name_cfg = {
