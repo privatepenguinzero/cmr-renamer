@@ -68,7 +68,7 @@ Falls back to the original per-field console prompts if `tkinter` is unavailable
 closed without saving.
 Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1..box5 crop coordinates
 for 2-5 boxes, anchor_x/anchor_y content-anchor reference, show_rects debug flag, lang, dpi, psm,
-o_zero_aspect, log_forme),
+o_zero_aspect, log_forme, min_confidence),
 `[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
 reads and type-converts every value out of the raw `ConfigParser` into plain dicts (`ocr_cfg`,
 `name_cfg`) before using them — if you add a config key, update both `config.py`'s prompts and this
@@ -86,23 +86,28 @@ add it. The box count is configurable from 2 to 5 (`MIN_BOXES`/`MAX_BOXES` in
 `psm`, `o_zero_aspect` and `log_forme` are optional and have no prompt either — they exist so the
 Tesseract page segmentation mode (default `OCR_PSM_DEFAULT`, 6 = single uniform block of text) and
 the O-vs-0 shape threshold (default `O_ZERO_ASPECT_DEFAULT`) can be tuned by hand, and the measured
-ratios logged for that tuning, without a rebuild.
+ratios logged for that tuning, without a rebuild. `min_confidence` (default
+`OCR_MIN_CONFIDENCE_DEFAULT`, on the 0-100 `x_wconf` scale) is the same kind of key: below it a
+warning is logged and the rename still happens.
 
 **Processing pipeline** (`_rinomina_pdf`): `pdf2image.convert_from_path` renders page 1 → `PIL` crops
 each of the 2-5 configured boxes → `_preprocess_for_ocr` (grayscale, autocontrast, fixed threshold,
 then a white `OCR_BORDER_PX` border — the official docs recommend padding tightly-cropped text)
-improves each crop → `pytesseract.image_to_string` OCRs each preprocessed crop with
-`_ocr_config(psm)` (`--psm 6`; without it Tesseract defaults to `--psm 3`, full-page layout
-analysis, which is wrong for a small crop and is where character shapes get misclassified) →
-`_rifinisci_o_zero` re-decides every `O`/`o`/`0` from the glyph's measured shape (see below) →
-`_pulisci_nome` strips characters illegal in a
+improves each crop → `_ocr_box` runs **one** Tesseract invocation per crop with
+`_ocr_config(psm)` + `-c hocr_char_boxes=1` (`--psm 6`; without it Tesseract defaults to `--psm 3`,
+full-page layout analysis, which is wrong for a small crop and is where character shapes get
+misclassified), and `_correggi_o_zero` re-decides every `O`/`o`/`0` from the glyph's measured shape
+(see below) → a warning is logged if the worst word confidence is below `min_confidence`, but the
+file is renamed anyway (deliberate: an uncertain read is often still right, and blocking the rename
+would do more harm than flagging it) → `_pulisci_nome` strips characters illegal in a
 filename (keeping `&` and `'`, both legal on Windows and common in company names), truncates to
 `max_length`, optionally strips leading zeros → the non-empty cleaned strings are joined with a
-single space into the new filename, with `(1)`, `(2)`, ... appended on collision. Before OCR, `_rinomina_pdf` calibrates the crop boxes via `_calibra_box`
+single space into the new filename, with `(1)`, `(2)`, ... appended on collision → the rename is
+appended to `rinomine.log` (see "Rename journal" below). Before OCR, `_rinomina_pdf` calibrates the crop boxes via `_calibra_box`
 whenever fewer than `MIN_BOXES` are configured (first PDF ever processed — the calibrator is
 mandatory then, and cancelling skips that file rather than cropping garbage) or whenever
 `show_rects` is `True` in `config.ini` (opt-in recalibration). `_calibra_box(pdf_paths, initial_path,
-boxes, dpi)` opens a Tk window with the rendered page on a scrollable/zoomable `Canvas` (mouse wheel
+boxes, ocr_cfg, name_cfg)` opens a Tk window with the rendered page on a scrollable/zoomable `Canvas` (mouse wheel
 or +/− buttons, scaled around a `base_scale` fit-to-screen and clamped by `MAX_ZOOM`/`MAX_DIM`),
 plus a sidebar `Listbox` of every PDF in the watched folder (`_list_watched_pdfs`, sorted
 alphabetically, `initial_path` preselected) so box placement can be checked live against multiple
@@ -115,7 +120,11 @@ correction — dragging on a non-reference file un-shifts the dropped position b
 the saved coordinate stays correct regardless of which file was on screen while dragging.
 Colored, numbered selector buttons (one per box, colors match the drawn rectangles) pick which box
 the next drag updates, plus `+ Box`/`− Box` buttons (disabled at 5/2 respectively) to change the box
-count; saving computes a *content anchor* via `_detect_content_anchor` (where the page's content
+count, plus a **Prova OCR** button that runs the real `_ocr_box` → `_pulisci_nome` chain on the
+boxes as currently drawn (applying the same `preview_shift` used for drawing, so it measures the
+crops the app would actually use on that file) and shows the per-box text, its confidence and the
+resulting filename in a label — without it, boxes are placed blind and the result only becomes
+visible after a file has already been renamed; saving computes a *content anchor* via `_detect_content_anchor` (where the page's content
 stops being white, from the top and from the left — a fast Pillow-only row/column darkness scan,
 no numpy/OpenCV) on whichever page is on screen at that moment, and persists both the box list and
 that anchor to `config.ini` via `_save_calibration_to_config`, applying them immediately to
@@ -128,22 +137,34 @@ the uncorrected calibrated boxes and logs a warning rather than blocking the fil
 without `anchor_x`/`anchor_y` (calibrated before this existed) simply skips correction — same
 optional-key pattern as `box1..5`/`show_rects`.
 
-**O-vs-0 disambiguation by glyph shape** (`_rifinisci_o_zero`): Tesseract confuses these two on
-scans, and the distinction is geometric rather than linguistic — letter `O` is a near-perfect circle
-(bounding-box width/height around 1.00 in common fonts), digit `0` a narrower oval (≈0.68 in
-Arial/Times, ≈0.81 in monospace). So after `image_to_string`, a second `image_to_boxes` pass over the
-*same* crop yields per-glyph bounding boxes; `_parse_glyph_boxes` turns the `makebox` lines
-(`char left bottom right top page`, bottom-left origin) into `(char, width, height)` and
-`_correggi_o_zero` re-decides each `O`/`o`/`0` against `o_zero_aspect`. When the shape says "letter"
-but Tesseract had read a digit, the case comes from the surrounding word via `_caso_da_contesto`.
+**O-vs-0 disambiguation by glyph shape** (`_ocr_box` → `_correggi_o_zero`): Tesseract confuses these
+two on scans, and the distinction is geometric rather than linguistic — letter `O` is a near-perfect
+circle (bounding-box width/height around 1.00 in common fonts), digit `0` a narrower oval (≈0.68 in
+Arial/Times, ≈0.81 in monospace, the tightest case). Measuring the glyph therefore settles it.
 
-Three properties worth preserving if you touch this: (1) genuine digits and genuine letters are both
-left alone — there is no class-wide conversion, which is the explicit requirement here, so a `3` in
-"3M" or an `O` in a document number survives; (2) box output carries no spaces or newlines, so the
-two readings are aligned character by character and **any** desync abandons the correction rather
-than applying a measurement to the wrong glyph; (3) the second pass runs only when the text actually
-contains an ambiguous glyph, and an exception in it keeps the original reading instead of failing
-the file.
+The measurement comes from hOCR: `_ocr_box` asks for `extension='hocr'` with `-c hocr_char_boxes=1`,
+which makes Tesseract emit, in one document, `ocr_line` → `ocrx_word` (carrying `x_wconf`) →
+`ocrx_cinfo` (carrying `x_bboxes` per character). `_parse_hocr` walks that into
+`{'testo', 'glifi', 'confidenze'}` and `_correggi_o_zero` re-decides each `O`/`o`/`0` against
+`o_zero_aspect`. When the shape says "letter" but Tesseract had read a digit, the case comes from the
+surrounding word via `_caso_da_contesto`.
+
+**hOCR coordinates are top-left origin**, unlike the `makebox` format an earlier version of this code
+used (bottom-left). Height is therefore `y1 - y0`. Getting this backwards inverts every ratio and
+breaks the discrimination *silently*, which is why `_misura_bbox` says so in its docstring and the
+test suite asserts on a known aspect ratio.
+
+Four properties worth preserving if you touch this:
+1. **Genuine digits and genuine letters are both left alone.** There is no class-wide conversion —
+   that is the explicit requirement here, so a `3` in "3M" or an `O` in a document number survives.
+   An earlier attempt at per-box `misto`/`testo`/`numeri` modes was removed for violating this.
+2. **One Tesseract invocation per crop.** Text, glyph geometry and confidence come from the same
+   parse, so the glyph list is aligned to the text *by construction*. The desync checks left in
+   `_correggi_o_zero` are a safety net against a mis-edited parser, not load-bearing logic.
+3. **Never more fragile than plain OCR.** If the hOCR call or its parsing raises, `_ocr_box` falls
+   back to `image_to_string` without correction; if that raises too, it returns empty text and the
+   file becomes `documento_senza_nome.pdf` rather than erroring out.
+4. **Low confidence warns, never blocks.** Deliberate user decision — see the processing pipeline above.
 
 **Why not `tessedit_char_whitelist`:** constraining the character set is the other obvious way to fix
 this, and it does not work. The parameter is unreliable with Tesseract 4/5's LSTM engine — it was
@@ -152,6 +173,21 @@ with diacritics, which is exactly ours (`ita+deu`). It works properly only under
 model data is not in the `tessdata_fast` files vendored under `vendor/tesseract/tessdata/`. It also
 could not express "this glyph is round, therefore a letter" at all — it can only forbid characters
 wholesale. Don't reach for it without verifying on real scans first.
+
+**Rename journal and undo** (`rinomine.log`, next to `config.ini`): every successful rename appends one
+JSON object per line — `{sessione, ts, cartella, da, a}`. JSON rather than TSV because after an
+unlucky OCR a filename can contain anything, tabs included. `sessione` is the process start
+timestamp, set once in `run()` into the module-level `_SESSIONE_ID`; keeping it in the file rather
+than only in memory is what lets the tray's "Annulla ultime rinomine" work after an exe restart.
+
+`_annulla_rinomine` restores the newest session in **reverse** order (so a chained A→B→C returns to
+A), skips any entry whose current file is gone or whose original name is taken, and appends a
+`{tipo: "undo"}` marker so a second click is a no-op. A partial undo with an honest count beats one
+that stops halfway leaving inconsistent state — hence the skipping rather than aborting. It asks for
+confirmation through `messagebox.askyesno` when `tkinter` is available: it renames files on a network
+share and a tray menu entry is easy to hit by accident. `_registra_rinomina` swallows and logs its own
+write errors: the rename already happened, and failing the file because it could not be journalled
+would be a worse cure than the disease.
 
 **Watching**: `CMRHandler` (a `watchdog` `FileSystemEventHandler`) reacts to created/moved/modified
 events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to stop
@@ -169,6 +205,32 @@ prints a warning and does nothing), and "Esci". This is the only way
 to exit a frozen+windowed instance, since it has no console/Ctrl+C available. Log output in
 background mode goes through `_RotatingWriter`, which caps `cmr-renamer.log` at ~1MB with one
 backup (`cmr-renamer.log.1`) instead of growing unbounded.
+
+**Bundled native dependencies** (`vendor/`, via Git LFS): Poppler and Tesseract are vendored and
+bundled into the exe by the two `--add-data` flags in the PyInstaller command. The payload is
+**deliberately slimmed** — 266 MB as shipped upstream, 54 MB here — by `tools/slim_vendor.py`:
+
+- Upstream Tesseract's Windows build is unstripped; 62% of the original payload was DWARF debug
+  sections. `libtesseract-5.dll` alone goes from 96.8 MB to 4.0 MB.
+- The 17 training executables (`lstmtraining`, `text2image`, `shapeclustering`, …) are removed: only
+  `tesseract.exe` is ever spawned.
+- So are the 25 DLLs unreachable from `tesseract.exe`'s import tables, 34 MB of which is the ICU
+  stack that only `text2image` needs (verified: `libtesseract-5.dll` imports no ICU).
+- `osd.traineddata` (10 MB) is removed — nothing here calls `image_to_osd` or `--psm 0`.
+- Poppler keeps **all** its DLLs and loses only its 10 uninvoked executables. Static import tables
+  cannot see a `LoadLibrary` call, and there were only ~2 MB to win there, so the risk was not worth
+  taking. Tesseract was the opposite trade.
+
+This matters specifically because the build is pinned to `--onefile`, which re-extracts the entire
+payload to a temp directory on **every launch** — the user cannot distribute a `--onedir` folder, so
+don't "fix" the startup cost that way.
+
+**Re-run `python3 tools/slim_vendor.py --apply` after re-vendoring** a newer Poppler or Tesseract, or
+the payload creeps back to 266 MB. It needs `objdump`/`objcopy` from GNU binutils, defaults to a
+dry-run report, and verifies afterwards that every import of every kept binary still resolves. That
+check compares against the *original* directory listing rather than an allowlist of Windows system
+DLLs, so it produces no false alarms — but it cannot see dynamic loading either, which is why a
+slimmed payload needs a smoke test of the built exe before being trusted.
 
 **Language note**: user-facing console strings and internal helper names (`_rinomina_pdf`,
 `_pulisci_nome`, `_file_pronto`) are Italian (the tool's target users); docstrings/comments are
