@@ -24,7 +24,7 @@ from watchdog.events import FileSystemEventHandler
 from .config import load_or_create_config
 
 try:
-    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox
+    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox, Radiobutton, StringVar
     from PIL import ImageTk
     TKINTER_AVAILABLE = True
 except ImportError:
@@ -437,17 +437,19 @@ def _list_watched_pdfs(folder: str) -> list:
     return [os.path.join(folder, f) for f in nomi]
 
 
-def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
+def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, char_modes: list, dpi: int):
     """Mostra la pagina 1 di un PDF a scelta tra `pdf_paths` e permette di ridisegnare 2-5 box col mouse.
 
     `pdf_paths` è l'elenco dei PDF della cartella monitorata, selezionabili da una lista laterale
     per confrontare visivamente se i box calibrati si applicano bene a più documenti; il cambio file
-    ridisegna solo l'immagine di sfondo, i box restano nelle stesse coordinate. `initial_path` è il
-    file mostrato all'apertura (preselezionato in lista). `boxes` è una lista di partenza di 2-5
-    tuple (x1,y1,x2,y2). Se l'utente salva, ritorna {'boxes': [...], 'anchor': (x,y) | None} —
-    l'ancora è rilevata sull'immagine visualizzata al momento del salvataggio (non necessariamente
-    quella di `initial_path`, se nel frattempo si è passati a un altro file dalla lista). Ritorna
-    None se l'utente annulla.
+    ridisegna solo l'immagine di sfondo e sposta i box del solo scostamento di deriva rilevato.
+    `initial_path` è il file mostrato all'apertura (preselezionato in lista). `boxes` è una lista di
+    partenza di 2-5 tuple (x1,y1,x2,y2); `char_modes` il tipo di carattere atteso per ciascun box
+    (valori in CHAR_MODES), normalizzato a `misto` dove manca. Se l'utente salva, ritorna
+    {'boxes': [...], 'char_modes': [...], 'anchor': (x,y) | None} — l'ancora è rilevata
+    sull'immagine visualizzata al momento del salvataggio (non necessariamente quella di
+    `initial_path`, se nel frattempo si è passati a un altro file dalla lista). Ritorna None se
+    l'utente annulla.
     """
     if not TKINTER_AVAILABLE:
         print("⚠️ tkinter non disponibile: calibrazione box saltata.")
@@ -464,11 +466,17 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
             image_cache[path] = _render_pdf_page(path, dpi)
         return image_cache[path]
 
+    modes_iniziali = [
+        char_modes[i] if i < len(char_modes) and char_modes[i] in CHAR_MODES else CHAR_MODE_MISTO
+        for i in range(len(boxes))
+    ]
+
     state = {
         'boxes': list(boxes),
+        'char_modes': modes_iniziali,
         'active': 0, 'start': None, 'drag_id': None, 'result': None,
         'zoom': 1.0, 'photo': None, 'img': None, 'current_path': initial_path,
-        'reference_anchor': None, 'preview_shift': (0, 0),
+        'reference_anchor': None, 'preview_shift': (0, 0), 'syncing': False,
     }
     drawn_ids: dict = {}
     select_buttons: dict = {}
@@ -508,6 +516,12 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
 
         zoom_frame = Frame(top_frame)
         zoom_frame.pack(side="left", padx=20)
+
+        mode_frame = Frame(top_frame)
+        mode_frame.pack(side="left", padx=20)
+
+        Label(mode_frame, text="Contenuto:").pack(side="left")
+        mode_var = StringVar(value=CHAR_MODE_MISTO)
 
         label = Label(root, text="")
         label.pack(pady=2)
@@ -610,10 +624,26 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
         Button(zoom_frame, text="+", command=zoom_in, width=3).pack(side="left")
         Button(zoom_frame, text="Reset zoom", command=zoom_reset).pack(side="left", padx=8)
 
+        def on_mode_change():
+            # set_active() aggiorna mode_var per riflettere il box appena selezionato:
+            # senza questa guardia quella scrittura verrebbe riapplicata al box attivo.
+            if state['syncing']:
+                return
+            state['char_modes'][state['active']] = mode_var.get()
+
+        for modo in CHAR_MODES:
+            Radiobutton(
+                mode_frame, text=CHAR_MODE_LABELS[modo], value=modo,
+                variable=mode_var, command=on_mode_change,
+            ).pack(side="left")
+
         def set_active(index):
             state['active'] = index
             for i, btn in select_buttons.items():
                 btn.config(relief=("sunken" if i == index else "raised"))
+            state['syncing'] = True
+            mode_var.set(state['char_modes'][index])
+            state['syncing'] = False
             label.config(text=f"Box attivo: {_box_label(index)}. Trascina col mouse per ridisegnarlo (rotellina per zoomare).")
 
         def update_count_buttons():
@@ -637,6 +667,7 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
             if len(state['boxes']) >= MAX_BOXES:
                 return
             state['boxes'].append(_default_box(len(state['boxes'])))
+            state['char_modes'].append(CHAR_MODE_MISTO)
             rebuild_select_buttons()
             set_active(len(state['boxes']) - 1)
             render()
@@ -646,6 +677,7 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
                 return
             removed = state['active']
             del state['boxes'][removed]
+            del state['char_modes'][removed]
             rebuild_select_buttons()
             set_active(max(removed - 1, 0))
             render()
@@ -733,7 +765,11 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, dpi: int):
         btn_frame.pack(pady=8)
 
         def on_save():
-            state['result'] = {'boxes': list(state['boxes']), 'anchor': _detect_content_anchor(state['img'])}
+            state['result'] = {
+                'boxes': list(state['boxes']),
+                'char_modes': list(state['char_modes']),
+                'anchor': _detect_content_anchor(state['img']),
+            }
             root.destroy()
 
         def on_cancel():
