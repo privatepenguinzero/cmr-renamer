@@ -1,0 +1,7 @@
+# Map historical author identities onto the current GitHub account.
+# The account was renamed from `icenoir` to `privatepenguinzero`. Some commits
+# also used a noreply address without the numeric ID prefix, which GitHub maps
+# to an unrelated account that later took that username.
+# This changes how git and the GitHub contributor views display authorship.
+# No commit is rewritten.
+privatepenguinzero <133494026+privatepenguinzero@users.noreply.github.com> <icenoir@example.com>
