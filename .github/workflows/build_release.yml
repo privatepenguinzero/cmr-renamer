@@ -68,7 +68,7 @@ jobs:
 
       # 🔟 Attach to release
       - name: Publish release asset
-        uses: softprops/action-gh-release@v3.0.2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           files: dist\cmr-renamer.exe
         env:
