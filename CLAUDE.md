@@ -282,6 +282,14 @@ raising on a headless Linux box) `run()` falls back to the old `stop_event.wait(
 simply no tray or calibrator. Images reach Qt as raw RGBA via `gui.da_pil`, never through Qt's own
 decoders, which is what lets the spec drop the image-format plugins.
 
+**Keep widgets native.** A Qt stylesheet on a widget replaces its native style outright: the first Qt
+calibrator colored its box buttons with one and the user reported the GUI "still looks like Tk".
+Colors go through `gui.campione_colore` (an icon swatch) or a `QPalette`; stylesheets are fine only
+for label text color. `gui._scegli_stile` switches to Fusion if neither `windows11` nor
+`windowsvista` is available on Windows — Qt's own fallback, the built-in "Windows" style, is a
+Windows 95 look that is easy to mistake for Tk. `run()` logs `gui.descrizione_stile()` (Qt version,
+active and available styles) at startup, so a missing style plugin shows up in the field log.
+
 **Auto-update** (`aggiornamento.py`, GUI-free; `run()` wires it in): same protocol as offerte-gen's
 C# launcher, reimplemented in Python inside the app because this is a `--onefile` exe on a single PC.
 Active only when frozen and `config.ini` has `[Aggiornamenti] token = ...` (fine-grained read-only

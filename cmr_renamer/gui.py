@@ -15,9 +15,9 @@ import threading
 # Broad guard, not just ImportError: a missing or broken Qt
 # install must leave the program without a GUI, not crash it.
 try:
-    from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot
-    from PySide6.QtGui import QIcon, QImage, QPixmap
-    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+    from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot, qVersion
+    from PySide6.QtGui import QColor, QIcon, QImage, QPixmap
+    from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QStyleFactory
     QT_AVAILABLE = True
 except Exception:
     QT_AVAILABLE = False
@@ -79,11 +79,47 @@ def applicazione():
             # The tray app has no main window: closing the calibrator or a
             # message box must not end the event loop.
             _app.setQuitOnLastWindowClosed(False)
+            _scegli_stile(_app)
             _ponte = _Ponte()
         except Exception as e:
             print(f"⚠️ Interfaccia Qt non disponibile: {e}")
             _app = None
     return _app
+
+
+# Native Windows looks, provided by plugins/styles/qmodernwindowsstyle.dll.
+STILI_NATIVI = ('windows11', 'windowsvista')
+
+
+def _scegli_stile(app) -> None:
+    """Avoid Qt's built-in "Windows" style, a Windows 95 look easily mistaken for Tk.
+
+    Qt picks the native style by itself when its plugin loads; if the plugin is
+    missing or fails to load, the fallback is that classic style. Fusion is
+    built in and looks current, so it is the better second choice.
+    """
+    disponibili = {k.lower() for k in QStyleFactory.keys()}
+    if sys.platform == 'win32' and not disponibili & set(STILI_NATIVI):
+        app.setStyle('Fusion')
+
+
+def descrizione_stile() -> str:
+    """Qt version, active style and available styles, for the startup log."""
+    if _app is None:
+        return "interfaccia grafica non disponibile"
+    return (f"Qt {qVersion()}, stile '{_app.style().name()}' "
+            f"(disponibili: {', '.join(QStyleFactory.keys())})")
+
+
+def campione_colore(colore: str, lato: int = 12) -> "QIcon":
+    """Small filled square, to tag a native widget with a color without a stylesheet.
+
+    A stylesheet on a button replaces the native style for it entirely, which
+    is what made the calibrator's box buttons look flat, like Tk.
+    """
+    pixmap = QPixmap(lato, lato)
+    pixmap.fill(QColor(colore))
+    return QIcon(pixmap)
 
 
 def disponibile() -> bool:

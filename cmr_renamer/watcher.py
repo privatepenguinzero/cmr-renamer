@@ -31,7 +31,7 @@ from . import __version__, aggiornamento, gui
 # without a display) the program runs headless — no tray, no calibrator.
 if gui.QT_AVAILABLE:
     from PySide6.QtCore import QRectF, Qt
-    from PySide6.QtGui import QColor, QPainter, QPen
+    from PySide6.QtGui import QColor, QPainter, QPalette, QPen
     from PySide6.QtWidgets import (
         QApplication, QDialog, QHBoxLayout, QLabel, QListWidget, QMenu, QPushButton,
         QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget,
@@ -1155,7 +1155,12 @@ def _finestra_calibrazione(pdf_paths: list, initial_path: str, initial_img: "Ima
     scroll = QScrollArea()
     scroll.setWidget(pagina)
     scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-    scroll.setStyleSheet("QScrollArea { background: #333333; }")
+    # Palette, not a stylesheet: a stylesheet would also strip the native
+    # look from the scroll bars.
+    sfondo = scroll.viewport().palette()
+    sfondo.setColor(QPalette.Window, QColor("#333333"))
+    scroll.viewport().setPalette(sfondo)
+    scroll.viewport().setAutoFillBackground(True)
     scroll.setMinimumSize(
         min(int(initial_img.width * base_scale) + 4, screen_w),
         min(int(initial_img.height * base_scale) + 4, screen_h),
@@ -1227,15 +1232,10 @@ def _finestra_calibrazione(pdf_paths: list, initial_path: str, initial_img: "Ima
             btn.deleteLater()
         select_buttons.clear()
         for i in range(len(state['boxes'])):
-            btn = QPushButton(_box_label(i))
+            # Native button: the swatch says which rectangle it is, the
+            # pressed (checked) state which one the next drag redraws.
+            btn = QPushButton(gui.campione_colore(BOX_COLORS[i]), _box_label(i))
             btn.setCheckable(True)
-            # The checked one gets a thick border: the color says which
-            # rectangle it is, the border which one the next drag redraws.
-            btn.setStyleSheet(
-                f"QPushButton {{ background: {BOX_COLORS[i]}; color: white; padding: 4px 8px;"
-                f" border: 2px solid {BOX_COLORS[i]}; }}"
-                f"QPushButton:checked {{ border: 3px solid black; font-weight: bold; }}"
-            )
             btn.clicked.connect(lambda _=False, n=i: set_active(n))
             select_row.addWidget(btn)
             select_buttons[i] = btn
@@ -1757,6 +1757,7 @@ def run() -> int:
     # loop and the actual work (startup sweep, observer) happens on a worker
     # thread. Created now, after the config form and file logging are set up.
     app = gui.applicazione()
+    print(f"ℹ️ {gui.descrizione_stile()}")
 
     stop_event = threading.Event()
     riavvio = {'tag': None}
