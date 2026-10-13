@@ -62,7 +62,10 @@ created interactively on first run by `config.py` (`load_or_create_config`). It 
 Tkinter form (`_prompt_with_gui`) covering every setting — folder (with a "Sfoglia..." button
 reusing the same `askdirectory` picker), prefix, delay, OCR language (checkboxes for the bundled
 `eng`/`ita`/`deu` plus a free-text field for extra codes, joined with `+` via `_build_lang_string`),
-dpi, max filename length, and the leading-zeros checkbox — validating delay/dpi/max_length as
+dpi, max filename length, and the leading-zeros checkbox — all three languages are checked by default
+and joined Italian-first (`ita+deu+eng`), because an `eng`-only config read "d.o.o." on a real CMR as
+"4.0.0." at confidence 45, where `ita` reads the "d" right (the LSTM engine treats the first language
+as primary); `run()` logs the configured languages at startup so this is visible in the field — validating delay/dpi/max_length as
 positive integers (`_parse_positive_int`) and requiring at least one language before saving.
 Falls back to the original per-field console prompts if `tkinter` is unavailable or the form is
 closed without saving.
@@ -157,8 +160,11 @@ no threshold could separate them. `_misura_glifo` therefore uses the box only to
 it searches the binarized crop within a margin (`GLIFO_MARGINE_X/Y`) and measures the connected dark
 components (`_componenti_scure`, pure-Python BFS, no numpy) that sit mostly inside the box — merging
 the pieces of an `O` broken by binarization, while excluding the period of "D.O.O." and neighboring
-glyphs. It falls back to Tesseract's box when the ink touches the search region's edge (glyph fused
-with a neighbor) or is less than half the box height, and returns *why* as its third value. Only
+glyphs. If the ink touches the search region's edge it re-measures with wider margins
+(`GLIFO_ALLARGAMENTI`) — on a real CMR the LSTM box was merely shifted a few pixels off the glyph
+(box 13x21, ink 15x16 at the region edge) — and only falls back to Tesseract's box when the ink still
+touches the widest region's edge (glyph fused with a neighbor) or is less than half the box height,
+returning *why* as its third value. Only
 `O`/`o`/`0` glyphs are measured.
 
 **`log_forme = true` is the field diagnostic**, since no real scan is available in development. Per

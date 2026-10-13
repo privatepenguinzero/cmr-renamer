@@ -33,14 +33,19 @@ def _parse_positive_int(value: str) -> "int | None":
 
 
 def _build_lang_string(eng: bool, ita: bool, deu: bool, extra: str) -> str:
-    """Unisce le lingue selezionate (checkbox) e il testo extra in una stringa tipo 'eng+ita'."""
+    """Unisce le lingue selezionate (checkbox) e il testo extra in una stringa tipo 'ita+deu+eng'.
+
+    L'italiano va per primo: con più lingue il motore LSTM usa la prima come
+    principale, e sul ritaglio reale di un CMR "ita" per prima ha letto meglio
+    (confidenza 92 contro 88 su "ELEKTRONIKA").
+    """
     codes = []
-    if eng:
-        codes.append('eng')
     if ita:
         codes.append('ita')
     if deu:
         codes.append('deu')
+    if eng:
+        codes.append('eng')
     extra_codes = [c.strip() for c in extra.split('+') if c.strip()]
     codes.extend(extra_codes)
     return '+'.join(codes)
@@ -86,8 +91,10 @@ def _prompt_with_gui() -> "dict | None":
         max_length_var = StringVar(value="60")
         extra_lang_var = StringVar(value="")
         eng_var = BooleanVar(value=True)
-        ita_var = BooleanVar(value=False)
-        deu_var = BooleanVar(value=False)
+        # Tutte e tre sono incluse nell'exe. Il solo "eng" leggeva "d.o.o." come
+        # "4.0.0." (confidenza 45) su un CMR reale, dove "ita" legge la "d" giusta.
+        ita_var = BooleanVar(value=True)
+        deu_var = BooleanVar(value=True)
         remove_zeros_var = BooleanVar(value=True)
 
         def browse_folder():
@@ -243,7 +250,7 @@ def load_or_create_config(config_path: str = None) -> "configparser.ConfigParser
             )
 
             config['OCR'] = {}
-            config['OCR']['lang'] = _prompt_console("Lingua OCR (eng/ita/deu/fra)", "eng")
+            config['OCR']['lang'] = _prompt_console("Lingua OCR (eng/ita/deu/fra)", "ita+deu+eng")
             config['OCR']['dpi'] = _prompt_console("DPI per conversione PDF", "300")
             # box1..box5 are intentionally not asked here: they have no sensible
             # generic default and are selected with the mouse on the first PDF

@@ -287,6 +287,9 @@ O_ZERO_BANDA_DEFAULT = 0.10
 # perché è la larghezza a essere imprecisa.
 GLIFO_MARGINE_X = 0.35
 GLIFO_MARGINE_Y = 0.15
+# Se l'inchiostro tocca il bordo della regione si rimisura con margini più ampi
+# (multipli di quelli sopra) prima di concludere che il glifo è fuso con un vicino.
+GLIFO_ALLARGAMENTI = (1, 2)
 
 _GLIFI_O_ZERO = frozenset('Oo0')
 
@@ -371,10 +374,12 @@ def _misura_glifo(img: "Image.Image", bbox: "tuple | None") -> tuple:
     dimensione paragonabile — i pezzi di una O spezzata dalla binarizzazione —
     escludendo così il punto di "D.O.O." e i glifi vicini.
 
-    Ripiega sulle dimensioni del box di Tesseract quando la misura non è credibile:
-    nessun inchiostro, altezza meno della metà del box, oppure inchiostro che arriva
-    al bordo della regione (glifo fuso con un vicino, la cui larghezza falserebbe
-    il rapporto).
+    Se l'inchiostro arriva al bordo della regione, la regione si allarga
+    (`GLIFO_ALLARGAMENTI`) e si rimisura: il box LSTM può essere semplicemente
+    spostato di qualche pixel rispetto al glifo, come per l'ultima "o" di "d.o.o."
+    su un CMR reale (box 13x21, inchiostro 15x16 a ridosso del bordo). Solo se
+    tocca il bordo anche della regione più ampia è davvero fuso con un vicino, e
+    allora — come con un inchiostro alto meno di metà box — vale il box.
     """
     if bbox is None:
         return (0, 0, "nessun box")
@@ -383,19 +388,41 @@ def _misura_glifo(img: "Image.Image", bbox: "tuple | None") -> tuple:
     if larghezza_box <= 0 or altezza_box <= 0:
         return (0, 0, "box vuoto")
 
-    mx = max(1, round(altezza_box * GLIFO_MARGINE_X))
-    my = max(1, round(altezza_box * GLIFO_MARGINE_Y))
+    for fattore in GLIFO_ALLARGAMENTI:
+        misura = _misura_in_regione(img, bbox, fattore)
+        if misura is None:
+            return (larghezza_box, altezza_box, "nessun inchiostro nel box")
+        larghezza, altezza, bordi = misura
+        if not bordi:
+            break
+    else:
+        return (larghezza_box, altezza_box,
+                f"inchiostro fuso oltre il margine a {'/'.join(bordi)} ({larghezza}x{altezza})")
+    if altezza < altezza_box * 0.5:
+        return (larghezza_box, altezza_box, f"inchiostro troppo basso ({larghezza}x{altezza})")
+    return (larghezza, altezza, None)
+
+
+def _misura_in_regione(img: "Image.Image", bbox: tuple, fattore: float) -> "tuple | None":
+    """(larghezza, altezza, bordi toccati) dell'inchiostro attorno a `bbox`; None se non ce n'è.
+
+    La regione è il box allargato di `fattore` volte i margini `GLIFO_MARGINE_X/Y`.
+    """
+    x0, y0, x1, y1 = bbox
+    altezza_box = y1 - y0
+    mx = max(1, round(altezza_box * GLIFO_MARGINE_X * fattore))
+    my = max(1, round(altezza_box * GLIFO_MARGINE_Y * fattore))
     rx0, ry0 = max(0, x0 - mx), max(0, y0 - my)
     rx1, ry1 = min(img.width, x1 + mx), min(img.height, y1 + my)
     if rx1 <= rx0 or ry1 <= ry0:
-        return (larghezza_box, altezza_box, "box fuori dall'immagine")
+        return None
     regione = img.crop((rx0, ry0, rx1, ry1)).convert('L')
     w, h = regione.size
     semi = (x0 - rx0, y0 - ry0, min(w, x1 - rx0), min(h, y1 - ry0))
 
     componenti = _componenti_scure(regione.load(), w, h, semi)
     if not componenti:
-        return (larghezza_box, altezza_box, "nessun inchiostro nel box")
+        return None
 
     principale = max(componenti, key=lambda c: c['dentro'])
     pw = principale['bbox'][2] - principale['bbox'][0] + 1
@@ -414,13 +441,7 @@ def _misura_glifo(img: "Image.Image", bbox: "tuple | None") -> tuple:
         ("sinistra", gx0 == 0 and rx0 > 0), ("destra", gx1 == w - 1 and rx1 < img.width),
         ("sopra", gy0 == 0 and ry0 > 0), ("sotto", gy1 == h - 1 and ry1 < img.height),
     ) if tocca]
-    larghezza, altezza = gx1 - gx0 + 1, gy1 - gy0 + 1
-    if bordi:
-        return (larghezza_box, altezza_box,
-                f"inchiostro fuso oltre il margine a {'/'.join(bordi)} ({larghezza}x{altezza})")
-    if altezza < altezza_box * 0.5:
-        return (larghezza_box, altezza_box, f"inchiostro troppo basso ({larghezza}x{altezza})")
-    return (larghezza, altezza, None)
+    return (gx1 - gx0 + 1, gy1 - gy0 + 1, bordi)
 
 
 def _misura_wconf(title: "str | None") -> "float | None":
@@ -1678,7 +1699,7 @@ def run() -> int:
     # repository privato si aggiunge a mano. Senza token non si controlla nulla.
     token_aggiornamenti = cfg.get('Aggiornamenti', 'token', fallback='').strip()
     aggiornamenti_attivi = cfg.getboolean('Aggiornamenti', 'attivo', fallback=True)
-    print(f"ℹ️ CMR Renamer {__version__}")
+    print(f"ℹ️ CMR Renamer {__version__} — lingue OCR: {ocr_cfg['lang']}")
     if _is_frozen():
         aggiornamento.pulisci_residui(sys.executable)
 
