@@ -35,9 +35,14 @@ uv run -- pyinstaller cmr-renamer.spec
   the native style (`QT_PLUGIN_TENUTI`).
 - Pillow's AVIF codec, plus `tkinter` and `PySide6.QtNetwork` via `excludes`.
 
+It also *adds* one thing: the Visual C++ runtime (`msvcp140`, `vcruntime140`, `vcruntime140_1`,
+copied from the PySide6 wheel) into `vendor/poppler/bin`. The vendored Poppler is an MSVC build whose
+folder lacks it; until v3.1.0 a copy happened to sit at the archive root (Tk's), from v3.2.0 it lived
+only in `PySide6/`, and `pdftoppm.exe` then depended on the PC having the VC++ Redistributable.
+
 If a new Qt feature needs a dropped file (an image-format plugin, say), widen `QT_PLUGIN_TENUTI`
-rather than going back to the command line. A release is signed only after checking the CI exe (see
-"Releasing"), so a filter that drops something needed never reaches the updater.
+rather than going back to the command line. A release is signed only after `tools/verifica_exe.py`
+passes (see "Releasing"), so a filter that drops something needed never reaches the updater.
 
 There is no test suite, linter, or formatter configured in this repo — don't assume `pytest`/`ruff`
 exist. Poppler and Tesseract are vendored under `vendor/` (via Git LFS) and bundled into the built
@@ -307,7 +312,15 @@ from the tray:
    `parse_versione` can't read. The value committed in the repo is only what source runs report;
    `__init__.py` stays the single source (`pyproject.toml` reads it via hatch). CI attaches
    `cmr-renamer.exe` and `cmr-renamer.exe.sha256`.
-2. Sign it locally: `uv run --with cryptography python tools/firma.py firma v3.1.0-beta.6`. The private
+2. Check the CI exe against the previous release, **before** signing:
+   `uv run --with pyinstaller python tools/verifica_exe.py v3.2.1 v3.2.2`. It fails if a binary lost
+   a DLL it used to find inside the archive, if a `vendor/` folder imports a non-system DLL it does
+   not contain (child processes like `pdftoppm.exe` don't see the archive root), or if a required file
+   (`qwindows.dll`, `tesseract.exe`, the traineddata) is missing. The updater ignores unsigned
+   releases, so this gate keeps a bad `cmr-renamer.spec` filter from reaching any PC — and an exe
+   that cannot start cannot update itself either. It cannot see `LoadLibrary` at runtime: it does
+   not replace running the exe on Windows.
+3. Sign it locally: `uv run --with cryptography python tools/firma.py firma v3.1.0-beta.6`. The private
    key lives in `~/.config/cmr-renamer/firma/chiave-privata.pem` (never in the repo — back it up;
    losing it means installed exes can no longer be updated automatically). It is a separate key
    from offerte-gen's.
