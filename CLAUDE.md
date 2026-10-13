@@ -63,9 +63,11 @@ Tkinter form (`_prompt_with_gui`) covering every setting — folder (with a "Sfo
 reusing the same `askdirectory` picker), prefix, delay, OCR language (checkboxes for the bundled
 `eng`/`ita`/`deu` plus a free-text field for extra codes, joined with `+` via `_build_lang_string`),
 dpi, max filename length, and the leading-zeros checkbox — all three languages are checked by default
-and joined Italian-first (`ita+deu+eng`), because an `eng`-only config read "d.o.o." on a real CMR as
-"4.0.0." at confidence 45, where `ita` reads the "d" right (the LSTM engine treats the first language
-as primary); `run()` logs the configured languages at startup so this is visible in the field — validating delay/dpi/max_length as
+and joined Italian-first (`ita+deu+eng`). **Order matters, not just the set**: the LSTM engine treats
+the first language as primary, and on a real CMR (verified on the user's machine, Tesseract 5.4.0)
+`eng+ita+deu` read "d.o.o." as "4.0.0." at confidence 45 while `ita+deu+eng` read the "d" right at 89.
+The old builder put `eng` first, so existing `config.ini` files need `lang` reordered by hand; `run()`
+logs the configured languages at startup so this is visible in the field — validating delay/dpi/max_length as
 positive integers (`_parse_positive_int`) and requiring at least one language before saving.
 Falls back to the original per-field console prompts if `tkinter` is unavailable or the form is
 closed without saving.
