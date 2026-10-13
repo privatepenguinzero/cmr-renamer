@@ -68,8 +68,9 @@ Falls back to the original per-field console prompts if `tkinter` is unavailable
 closed without saving.
 Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1..box5 crop coordinates
 for 2-5 boxes, anchor_x/anchor_y content-anchor reference, show_rects debug flag, lang, dpi, psm,
-o_zero_aspect, log_forme, min_confidence),
-`[Filename]` (max_length, remove_leading_zeros). `watcher.run()`
+o_zero_aspect, o_zero_banda, log_forme, min_confidence),
+`[Filename]` (max_length, remove_leading_zeros), optional `[Aggiornamenti]` (token, attivo — see
+"Auto-update"). `watcher.run()`
 reads and type-converts every value out of the raw `ConfigParser` into plain dicts (`ocr_cfg`,
 `name_cfg`) before using them — if you add a config key, update both `config.py`'s prompts and this
 parsing step. `prefix` is read with `cfg['Watcher'].get('prefix', 'DOC')` rather than a plain
@@ -83,9 +84,10 @@ calibrator (see below) fills them in and writes them back with `_save_calibratio
 add it. The box count is configurable from 2 to 5 (`MIN_BOXES`/`MAX_BOXES` in
 `watcher.py`) via `+`/`−` buttons in the calibrator itself, not a config prompt; existing
 `config.ini` files with only `box1`/`box2` load transparently as a 2-box config.
-`psm`, `o_zero_aspect` and `log_forme` are optional and have no prompt either — they exist so the
-Tesseract page segmentation mode (default `OCR_PSM_DEFAULT`, 6 = single uniform block of text) and
-the O-vs-0 shape threshold (default `O_ZERO_ASPECT_DEFAULT`) can be tuned by hand, and the measured
+`psm`, `o_zero_aspect`, `o_zero_banda` and `log_forme` are optional and have no prompt either — they
+exist so the Tesseract page segmentation mode (default `OCR_PSM_DEFAULT`, 6 = single uniform block of
+text), the O-vs-0 shape threshold (default `O_ZERO_ASPECT_DEFAULT`) and the uncertain band around it
+where context decides (default `O_ZERO_BANDA_DEFAULT`; `0` restores shape-only) can be tuned by hand, and the measured
 ratios logged for that tuning, without a rebuild. `min_confidence` (default
 `OCR_MIN_CONFIDENCE_DEFAULT`, on the 0-100 `x_wconf` scale) is the same kind of key: below it a
 warning is logged and the rename still happens.
@@ -145,14 +147,28 @@ Arial/Times, ≈0.81 in monospace, the tightest case). Measuring the glyph there
 The measurement comes from hOCR: `_ocr_box` asks for `extension='hocr'` with `-c hocr_char_boxes=1`,
 which makes Tesseract emit, in one document, `ocr_line` → `ocrx_word` (carrying `x_wconf`) →
 `ocrx_cinfo` (carrying `x_bboxes` per character). `_parse_hocr` walks that into
-`{'testo', 'glifi', 'confidenze'}` and `_correggi_o_zero` re-decides each `O`/`o`/`0` against
-`o_zero_aspect`. When the shape says "letter" but Tesseract had read a digit, the case comes from the
-surrounding word via `_caso_da_contesto`.
+`{'testo', 'glifi', 'confidenze'}`, with each glyph's box as coordinates. When the shape says
+"letter" but Tesseract had read a digit, the case comes from the surrounding word via
+`_caso_da_contesto`.
+
+**The glyph is measured on the ink, not on Tesseract's box.** LSTM per-character boxes are
+approximate: on a real CMR a genuine `O` came back at 0.62, indistinguishable from a `0` at 0.64, so
+no threshold could separate them. `_misura_glifo` therefore uses the box only to *locate* the glyph:
+it searches the binarized crop within a margin (`GLIFO_MARGINE_X/Y`) and measures the connected dark
+components (`_componenti_scure`, pure-Python BFS, no numpy) that sit mostly inside the box — merging
+the pieces of an `O` broken by binarization, while excluding the period of "D.O.O." and neighboring
+glyphs. It falls back to Tesseract's box when the ink touches the search region's edge (glyph fused
+with a neighbor) or is less than half the box height. Only `O`/`o`/`0` glyphs are measured.
+
+**Context decides only in the uncertain band.** `_correggi_o_zero` decides by shape, except when the
+ratio falls within `o_zero_banda` of `o_zero_aspect`: there `_tipo_da_contesto` looks at the nearest
+non-O/0 alphanumeric on each side within the word (skipping internal punctuation) — letters → letter,
+digits → digit, tie or none → shape. Outside the band shape always wins, so a clear `0` inside "AB0123"
+stays a digit. This is still a per-glyph decision, not a class-wide conversion (property 1 below).
 
 **hOCR coordinates are top-left origin**, unlike the `makebox` format an earlier version of this code
 used (bottom-left). Height is therefore `y1 - y0`. Getting this backwards inverts every ratio and
-breaks the discrimination *silently*, which is why `_misura_bbox` says so in its docstring and the
-test suite asserts on a known aspect ratio.
+breaks the discrimination *silently*, which is why `_leggi_bbox` says so in its docstring.
 
 Four properties worth preserving if you touch this:
 1. **Genuine digits and genuine letters are both left alone.** There is no class-wide conversion —
@@ -204,7 +220,45 @@ opens the same `_calibra_box` calibrator against that list — no file picker; a
 prints a warning and does nothing), and "Esci". This is the only way
 to exit a frozen+windowed instance, since it has no console/Ctrl+C available. Log output in
 background mode goes through `_RotatingWriter`, which caps `cmr-renamer.log` at ~1MB with one
-backup (`cmr-renamer.log.1`) instead of growing unbounded.
+backup (`cmr-renamer.log.1`) instead of growing unbounded. The menu also shows the running version
+(disabled item) and, when the updater is active, "Controlla aggiornamenti".
+
+**Auto-update** (`aggiornamento.py`, GUI-free; `run()` wires it in): same protocol as offerte-gen's
+C# launcher, reimplemented in Python inside the app because this is a `--onefile` exe on a single PC.
+Active only when frozen and `config.ini` has `[Aggiornamenti] token = ...` (fine-grained read-only
+token for the private repo; no setup prompt, same optional-key pattern as `show_rects`;
+`attivo = false` disables it). `Aggiornatore` checks 60 s after start, then every 6 h, plus on demand
+from the tray:
+- `GET /repos/privatepenguinzero/cmr-renamer/releases` (not `/releases/latest`, which hides
+  pre-releases — the user chose to receive betas). `scegli_release` takes the highest version newer
+  than `__version__` that carries all three assets `cmr-renamer.exe`, `.sha256`, `.sig`; unsigned
+  releases are skipped until signed. `parse_versione` understands both tag form (`v3.1.0-beta.5`)
+  and PEP 440 (`3.1.0b5`), final > rc > beta > alpha.
+- Assets are fetched through the API URL; the redirect to GitHub's storage is followed **by hand
+  without the token** (`_apri`), since urllib would otherwise forward `Authorization`.
+- `installa` downloads to `<exe>.new`, checks SHA-256 and then the RSA-3072 PKCS#1 v1.5 signature —
+  verified in pure Python (`firma_valida`, no `cryptography` in the exe) against the public key
+  constants in the module. Only then: `<exe>` → `<exe>.old` (Windows allows renaming a running exe),
+  `.new` → `<exe>`, rolling back the first rename if the second fails. `.old` is deleted at the next
+  start (`pulisci_residui`).
+- `al_riavvio` stops the tray and sets `stop_event`; `run()` then stops the observer (`join` waits
+  for the file being processed) and launches the new exe with `PYINSTALLER_RESET_ENVIRONMENT=1` —
+  without it a `--onefile` child would reuse this process's `_MEI` temp dir, which is deleted on exit.
+- The token expiry (`github-authentication-token-expiration` header) is reported when ≤ 30 days.
+
+**Releasing** (order matters, or the updater won't see the release):
+1. Publish the GitHub release (tag like `v3.1.0-beta.6`, pre-release for betas). **No manual
+   version bump**: the workflow's first step rewrites `__version__` in `cmr_renamer/__init__.py`
+   from the tag (`v3.1.0-beta.6` → `3.1.0b6`) before `uv sync` and PyInstaller, and fails on a tag
+   `parse_versione` can't read. The value committed in the repo is only what source runs report;
+   `__init__.py` stays the single source (`pyproject.toml` reads it via hatch). CI attaches
+   `cmr-renamer.exe` and `cmr-renamer.exe.sha256`.
+2. Sign it locally: `uv run --with cryptography python tools/firma.py firma v3.1.0-beta.6`. The private
+   key lives in `~/.config/cmr-renamer/firma/chiave-privata.pem` (never in the repo — back it up;
+   losing it means installed exes can no longer be updated automatically). It is a separate key
+   from offerte-gen's.
+
+Installed exes older than the first updater-enabled version must be replaced by hand once.
 
 **Bundled native dependencies** (`vendor/`, via Git LFS): Poppler and Tesseract are vendored and
 bundled into the exe by the two `--add-data` flags in the PyInstaller command. The payload is

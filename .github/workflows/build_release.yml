@@ -24,6 +24,35 @@ jobs:
         with:
           python-version: "3.10"
 
+      # La versione dell'exe viene dal tag della release, non dal repository:
+      # pubblicare "v3.1.0-beta.6" basta, __version__ si scrive qui ("3.1.0b6").
+      # L'aggiornamento automatico confronta proprio questi due valori, quindi
+      # derivarli l'uno dall'altro li tiene allineati per costruzione. Va fatto
+      # prima di uv sync, che legge la versione del pacchetto da __init__.py.
+      - name: Set __version__ from release tag
+        run: |
+          python - <<'EOF'
+          import os, re, sys
+          sys.path.insert(0, '.')
+          from cmr_renamer.aggiornamento import parse_versione
+          tag = os.environ['TAG']
+          v = parse_versione(tag)
+          if v is None:
+              sys.exit(f"tag '{tag}' non riconosciuto: usa vX.Y.Z, vX.Y.Z-beta.N o vX.Y.Z-rc.N")
+          suffisso = {0: 'a', 1: 'b', 2: 'rc'}.get(v[3])
+          versione = f"{v[0]}.{v[1]}.{v[2]}" + (f"{suffisso}{v[4]}" if suffisso else "")
+          percorso = 'cmr_renamer/__init__.py'
+          testo = open(percorso, encoding='utf-8').read()
+          testo, n = re.subn(r'^__version__ = ".*"$', f'__version__ = "{versione}"', testo, flags=re.M)
+          if n != 1:
+              sys.exit("__version__ non trovato in " + percorso)
+          open(percorso, 'w', encoding='utf-8').write(testo)
+          print(f"__version__ = {versione} (dal tag {tag})")
+          EOF
+        shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+
       # 3️⃣ Install uv
       - name: Install uv
         run: pip install --upgrade uv
@@ -66,10 +95,20 @@ jobs:
           name: cmr-renamer-windows-exe
           path: dist\cmr-renamer.exe
 
+      # Impronta letta dall'aggiornamento automatico. La firma (.sig) non si fa qui:
+      # la chiave privata non sta su GitHub, si aggiunge dopo con tools/firma.py.
+      - name: Compute SHA-256
+        run: |
+          $h = (Get-FileHash dist\cmr-renamer.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path dist\cmr-renamer.exe.sha256 -Value "$h  cmr-renamer.exe" -NoNewline -Encoding ascii
+        shell: pwsh
+
       # 🔟 Attach to release
       - name: Publish release asset
         uses: softprops/action-gh-release@v3.0.2
         with:
-          files: dist\cmr-renamer.exe
+          files: |
+            dist/cmr-renamer.exe
+            dist/cmr-renamer.exe.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

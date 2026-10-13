@@ -24,6 +24,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from .config import load_or_create_config
+from . import __version__, aggiornamento
 
 # Entrambe le dipendenze sono opzionali e vanno degradate silenziosamente, non solo
 # quando mancano: importare pystray su una macchina senza display avvia la ricerca
@@ -246,6 +247,21 @@ def _preprocess_for_ocr(img: "Image.Image") -> "Image.Image":
 # e `o_zero_aspect` la sovrascrive senza ricompilare.
 O_ZERO_ASPECT_DEFAULT = 0.80
 
+# Semiampiezza della fascia attorno alla soglia in cui la forma da sola non
+# basta: lì decidono i caratteri vicini nella stessa parola (lettere → lettera,
+# cifre → cifra), e solo se il contesto è muto resta la forma. Fuori dalla fascia
+# decide sempre la forma, così uno 0 netto dentro un codice come "AB0123" resta 0.
+# Su CMR reali una O di "ELEKTRONIKA" ha misurato 0.77, appena sotto 0.80.
+O_ZERO_BANDA_DEFAULT = 0.10
+
+# Margine attorno al box del carattere restituito da Tesseract entro cui cercare
+# l'inchiostro del glifo, in frazione dell'altezza del box. Con il motore LSTM le
+# coordinate per carattere sono approssimate e possono tagliare il glifo: una O
+# vera è stata misurata 0.62, da cifra. Orizzontalmente il margine è più ampio
+# perché è la larghezza a essere imprecisa.
+GLIFO_MARGINE_X = 0.35
+GLIFO_MARGINE_Y = 0.15
+
 _GLIFI_O_ZERO = frozenset('Oo0')
 
 
@@ -258,15 +274,15 @@ def _elementi_classe(radice, nome: str) -> list:
     return [el for el in radice.iter() if el.get('class') == nome]
 
 
-def _misura_bbox(title: "str | None") -> tuple:
-    """(larghezza, altezza) da un title hOCR contenente `x_bboxes x0 y0 x1 y1` o `bbox ...`.
+def _leggi_bbox(title: "str | None") -> "tuple[int, int, int, int] | None":
+    """(x0, y0, x1, y1) da un title hOCR contenente `x_bboxes x0 y0 x1 y1` o `bbox ...`.
 
     Le coordinate hOCR hanno origine in ALTO a sinistra — al contrario del formato
     makebox — quindi l'altezza è y1-y0. Invertirlo capovolgerebbe il rapporto
     larghezza/altezza e con esso la discriminazione O/0.
     """
     if not title:
-        return (0, 0)
+        return None
     for chiave in ('x_bboxes', 'bbox'):
         for campo in title.split(';'):
             parti = campo.split()
@@ -275,8 +291,101 @@ def _misura_bbox(title: "str | None") -> tuple:
                     x0, y0, x1, y1 = (int(v) for v in parti[1:5])
                 except ValueError:
                     continue
-                return (x1 - x0, y1 - y0)
-    return (0, 0)
+                return (x0, y0, x1, y1)
+    return None
+
+
+def _componenti_scure(px, larghezza: int, altezza: int, semi: tuple) -> list:
+    """Componenti connesse (8-vicinato) di pixel scuri che toccano il rettangolo `semi`.
+
+    Ritorna per ognuna {'tot', 'dentro', 'bbox': [x0, y0, x1, y1]}, dove `dentro`
+    conta i pixel che cadono in `semi`. Visita in ampiezza in Python puro: la
+    regione è un solo glifo con un po' di margine, poche migliaia di pixel.
+    """
+    sx0, sy0, sx1, sy1 = semi
+    visto = bytearray(larghezza * altezza)
+    componenti = []
+    for y in range(sy0, sy1):
+        for x in range(sx0, sx1):
+            if visto[y * larghezza + x] or px[x, y] >= 128:
+                continue
+            visto[y * larghezza + x] = 1
+            coda = [(x, y)]
+            comp = {'tot': 0, 'dentro': 0, 'bbox': [x, y, x, y]}
+            while coda:
+                cx, cy = coda.pop()
+                comp['tot'] += 1
+                if sx0 <= cx < sx1 and sy0 <= cy < sy1:
+                    comp['dentro'] += 1
+                b = comp['bbox']
+                b[0], b[1] = min(b[0], cx), min(b[1], cy)
+                b[2], b[3] = max(b[2], cx), max(b[3], cy)
+                for nx in (cx - 1, cx, cx + 1):
+                    for ny in (cy - 1, cy, cy + 1):
+                        if 0 <= nx < larghezza and 0 <= ny < altezza:
+                            i = ny * larghezza + nx
+                            if not visto[i] and px[nx, ny] < 128:
+                                visto[i] = 1
+                                coda.append((nx, ny))
+            componenti.append(comp)
+    return componenti
+
+
+def _misura_glifo(img: "Image.Image", bbox: "tuple | None") -> tuple:
+    """(larghezza, altezza) del glifo misurate sull'inchiostro dell'immagine binarizzata.
+
+    Il box per carattere di Tesseract serve solo a dire *dove* sta il glifo: la
+    misura si fa sui pixel scuri attorno, cercati con un margine (`GLIFO_MARGINE_X/Y`)
+    perché il box LSTM può tagliare il glifo. Si prende la componente connessa con
+    più pixel dentro il box, più quelle che vi cadono per lo più dentro e hanno una
+    dimensione paragonabile — i pezzi di una O spezzata dalla binarizzazione —
+    escludendo così il punto di "D.O.O." e i glifi vicini.
+
+    Ripiega sulle dimensioni del box di Tesseract quando la misura non è credibile:
+    nessun inchiostro, altezza meno della metà del box, oppure inchiostro che arriva
+    al bordo della regione (glifo fuso con un vicino, la cui larghezza falserebbe
+    il rapporto).
+    """
+    if bbox is None:
+        return (0, 0)
+    x0, y0, x1, y1 = bbox
+    larghezza_box, altezza_box = x1 - x0, y1 - y0
+    if larghezza_box <= 0 or altezza_box <= 0:
+        return (0, 0)
+
+    mx = max(1, round(altezza_box * GLIFO_MARGINE_X))
+    my = max(1, round(altezza_box * GLIFO_MARGINE_Y))
+    rx0, ry0 = max(0, x0 - mx), max(0, y0 - my)
+    rx1, ry1 = min(img.width, x1 + mx), min(img.height, y1 + my)
+    if rx1 <= rx0 or ry1 <= ry0:
+        return (larghezza_box, altezza_box)
+    regione = img.crop((rx0, ry0, rx1, ry1)).convert('L')
+    w, h = regione.size
+    semi = (x0 - rx0, y0 - ry0, min(w, x1 - rx0), min(h, y1 - ry0))
+
+    componenti = _componenti_scure(regione.load(), w, h, semi)
+    if not componenti:
+        return (larghezza_box, altezza_box)
+
+    principale = max(componenti, key=lambda c: c['dentro'])
+    pw = principale['bbox'][2] - principale['bbox'][0] + 1
+    ph = principale['bbox'][3] - principale['bbox'][1] + 1
+    gx0, gy0, gx1, gy1 = principale['bbox']
+    for c in componenti:
+        if c is principale or c['dentro'] < c['tot'] * 0.5:
+            continue
+        cw = c['bbox'][2] - c['bbox'][0] + 1
+        ch = c['bbox'][3] - c['bbox'][1] + 1
+        if cw >= pw * 0.4 or ch >= ph * 0.4:
+            gx0, gy0 = min(gx0, c['bbox'][0]), min(gy0, c['bbox'][1])
+            gx1, gy1 = max(gx1, c['bbox'][2]), max(gy1, c['bbox'][3])
+
+    tocca_bordo = (gx0 == 0 and rx0 > 0) or (gx1 == w - 1 and rx1 < img.width) \
+        or (gy0 == 0 and ry0 > 0) or (gy1 == h - 1 and ry1 < img.height)
+    misura = (gx1 - gx0 + 1, gy1 - gy0 + 1)
+    if tocca_bordo or misura[1] < altezza_box * 0.5:
+        return (larghezza_box, altezza_box)
+    return misura
 
 
 def _misura_wconf(title: "str | None") -> "float | None":
@@ -296,14 +405,15 @@ def _misura_wconf(title: "str | None") -> "float | None":
 def _parse_hocr(xml_bytes: bytes) -> dict:
     """Estrae testo, geometria per carattere e confidenza da un hOCR di Tesseract.
 
-    Ritorna {'testo': str, 'glifi': [(carattere, larghezza, altezza)], 'confidenze': [float]}.
-    `glifi` ha un elemento per ogni carattere non-spazio di `testo`, nello stesso
-    ordine: l'allineamento è per costruzione, non ricostruito a posteriori come
-    servirebbe confrontando due letture indipendenti.
+    Ritorna {'testo': str, 'glifi': [(carattere, bbox)], 'confidenze': [float]},
+    con `bbox` = (x0, y0, x1, y1) nelle coordinate dell'immagine passata a
+    Tesseract, oppure None. `glifi` ha un elemento per ogni carattere non-spazio
+    di `testo`, nello stesso ordine: l'allineamento è per costruzione, non
+    ricostruito a posteriori come servirebbe confrontando due letture indipendenti.
 
     Un `ocrx_word` privo di figli `ocrx_cinfo` (char box non richiesti o non
-    prodotti) contribuisce comunque al testo, con glifi segnaposto ad altezza 0
-    che `_correggi_o_zero` salta.
+    prodotti) contribuisce comunque al testo, con bbox None che
+    `_correggi_o_zero` salta.
 
     Solleva su XML malformato: il chiamante ripiega su `image_to_string`.
     """
@@ -324,14 +434,14 @@ def _parse_hocr(xml_bytes: bytes) -> dict:
                     contenuto = (c.text or '').strip()
                     if not contenuto:
                         continue
-                    larghezza, altezza = _misura_bbox(c.get('title'))
+                    bbox = _leggi_bbox(c.get('title'))
                     testo_parola += contenuto
                     # Il contenuto è normalmente un solo carattere; se non lo
                     # fosse, un glifo per carattere mantiene l'allineamento.
-                    glifi.extend((ch, larghezza, altezza) for ch in contenuto)
+                    glifi.extend((ch, bbox) for ch in contenuto)
             else:
                 testo_parola = ''.join(parola_el.itertext()).strip()
-                glifi.extend((ch, 0, 0) for ch in testo_parola if not ch.isspace())
+                glifi.extend((ch, None) for ch in testo_parola if not ch.isspace())
 
             if testo_parola:
                 parole.append(testo_parola)
@@ -357,17 +467,47 @@ def _caso_da_contesto(caratteri: list, pos: int) -> str:
     return 'o' if minuscole > maiuscole else 'O'
 
 
-def _correggi_o_zero(testo: str, glifi: list, soglia: float, log_forme: bool = False) -> str:
+def _tipo_da_contesto(caratteri: list, pos: int) -> "str | None":
+    """'lettera', 'cifra' o None secondo i vicini del glifo nella stessa parola.
+
+    Per ogni lato si prende il primo carattere alfanumerico che non sia a sua
+    volta O/o/0 (ambiguo per definizione), saltando la punteggiatura interna
+    come i punti di "D.O.O.". Pareggio o nessun vicino: None, decide la forma.
+    """
+    lettere = cifre = 0
+    for direzione in (-1, 1):
+        i = pos + direzione
+        while 0 <= i < len(caratteri) and not caratteri[i].isspace():
+            c = caratteri[i]
+            if c.isalnum() and c not in _GLIFI_O_ZERO:
+                if c.isalpha():
+                    lettere += 1
+                else:
+                    cifre += 1
+                break
+            i += direzione
+    if lettere > cifre:
+        return 'lettera'
+    if cifre > lettere:
+        return 'cifra'
+    return None
+
+
+def _correggi_o_zero(testo: str, glifi: list, soglia: float, log_forme: bool = False,
+                     banda: float = O_ZERO_BANDA_DEFAULT) -> str:
     """Ridecide ogni glifo O/o/0 del testo in base alla forma misurata sull'immagine.
 
-    `glifi` è la sequenza restituita da `_parse_hocr`: gli stessi caratteri del
-    testo, nello stesso ordine, ma senza spazi né ritorni a capo. Provenendo dal
-    medesimo parse, l'allineamento è garantito per costruzione; i controlli qui
-    sotto restano come rete di sicurezza contro un parser modificato male, e
-    fanno tornare il testo intatto anziché applicare una misura al glifo sbagliato.
+    `glifi` è una sequenza di (carattere, larghezza, altezza): gli stessi caratteri
+    del testo, nello stesso ordine, ma senza spazi né ritorni a capo, con le misure
+    di `_misura_glifo`. Provenendo dal medesimo parse hOCR, l'allineamento è
+    garantito per costruzione; i controlli qui sotto restano come rete di sicurezza
+    contro un parser modificato male, e fanno tornare il testo intatto anziché
+    applicare una misura al glifo sbagliato.
 
-    A differenza di una conversione per classe, qui una cifra che è davvero una
-    cifra e una lettera che è davvero una lettera restano quello che sono.
+    Quando il rapporto cade entro `banda` dalla soglia, la forma è considerata
+    incerta e decidono i vicini (`_tipo_da_contesto`). Resta una decisione per
+    singolo glifo: una cifra che è davvero una cifra e una lettera che è davvero
+    una lettera restano quello che sono.
     """
     if not any(c in _GLIFI_O_ZERO for c in testo):
         return testo
@@ -393,16 +533,23 @@ def _correggi_o_zero(testo: str, glifi: list, soglia: float, log_forme: bool = F
         if originale not in _GLIFI_O_ZERO or altezza <= 0:
             continue
         rapporto = larghezza / altezza
-        if rapporto >= soglia:
-            # Tondo: è una lettera. Se Tesseract aveva già letto una lettera si
-            # conserva il suo caso, altrimenti lo si deduce dalla parola.
+        tipo = 'lettera' if rapporto >= soglia else 'cifra'
+        motivo = 'forma'
+        if abs(rapporto - soglia) < banda:
+            dal_contesto = _tipo_da_contesto(caratteri, pos)
+            if dal_contesto:
+                tipo, motivo = dal_contesto, 'contesto'
+        if tipo == 'lettera':
+            # Se Tesseract aveva già letto una lettera si conserva il suo caso,
+            # altrimenti lo si deduce dalla parola.
             deciso = originale if originale.isalpha() else _caso_da_contesto(caratteri, pos)
         else:
             deciso = '0'
         if log_forme:
-            print(f"   forma '{originale}' rapporto {rapporto:.2f} (soglia {soglia:.2f}) → '{deciso}'")
+            print(f"   forma '{originale}' rapporto {rapporto:.2f} (soglia {soglia:.2f}) "
+                  f"→ '{deciso}' [{motivo}]")
         elif deciso != originale:
-            print(f"   ↻ '{originale}' → '{deciso}' (rapporto forma {rapporto:.2f})")
+            print(f"   ↻ '{originale}' → '{deciso}' (rapporto forma {rapporto:.2f}, {motivo})")
         caratteri[pos] = deciso
     return ''.join(caratteri)
 
@@ -443,10 +590,17 @@ def _ocr_box(crop: "Image.Image", ocr_cfg: dict) -> dict:
             return {'testo': '', 'confidenza_min': None}
         return {'testo': testo, 'confidenza_min': None}
 
+    # Si misurano solo i glifi ambigui: gli altri servono a _correggi_o_zero
+    # unicamente per il controllo di allineamento.
+    glifi = [
+        (ch, *_misura_glifo(crop, bbox)) if ch in _GLIFI_O_ZERO else (ch, 0, 0)
+        for ch, bbox in risultato['glifi']
+    ]
     testo = _correggi_o_zero(
-        risultato['testo'], risultato['glifi'],
+        risultato['testo'], glifi,
         ocr_cfg.get('o_zero_aspect', O_ZERO_ASPECT_DEFAULT),
         ocr_cfg.get('log_forme', False),
+        ocr_cfg.get('o_zero_banda', O_ZERO_BANDA_DEFAULT),
     )
     confidenze = risultato['confidenze']
     return {
@@ -1075,8 +1229,25 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, ocr_cfg: dict,
 
 
 def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, name_cfg: dict, log_path: str,
-                      cartella: str, stop_event: "threading.Event") -> "pystray.Icon":
+                      cartella: str, stop_event: "threading.Event",
+                      aggiornatore: "aggiornamento.Aggiornatore | None" = None) -> "pystray.Icon":
     """Crea l'icona di system tray con il menu di controllo del background mode."""
+
+    def _controlla_aggiornamenti(icon, item):
+        # Rete e download possono durare decine di secondi: fuori dal thread del
+        # tray, che altrimenti resterebbe bloccato con il menu.
+        def controlla():
+            esito = aggiornatore.controlla()
+            if TKINTER_AVAILABLE and "riavvio in corso" not in esito:
+                try:
+                    radice = Tk()
+                    radice.withdraw()
+                    messagebox.showinfo("CMR Renamer", esito)
+                    radice.destroy()
+                except Exception as e:
+                    print(f"⚠️ Impossibile mostrare l'esito ({e}).")
+
+        threading.Thread(target=controlla, daemon=True).start()
 
     def _open_log(icon, item):
         try:
@@ -1142,13 +1313,17 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, name_cfg: dict, l
         icon.stop()
         stop_event.set()
 
-    menu = pystray.Menu(
+    voci = [
+        pystray.MenuItem(f"CMR Renamer {__version__}", None, enabled=False),
         pystray.MenuItem("Apri log", _open_log),
         pystray.MenuItem("Apri cartella monitorata", _open_folder),
         pystray.MenuItem("Ricalibra box", _recalibra),
         pystray.MenuItem("Annulla ultime rinomine", _annulla),
-        pystray.MenuItem("Esci", _exit),
-    )
+    ]
+    if aggiornatore is not None:
+        voci.append(pystray.MenuItem("Controlla aggiornamenti", _controlla_aggiornamenti))
+    voci.append(pystray.MenuItem("Esci", _exit))
+    menu = pystray.Menu(*voci)
     return pystray.Icon("cmr-renamer", icon_image, "CMR Renamer", menu)
 
 
@@ -1402,6 +1577,7 @@ def run() -> int:
         'dpi': int(cfg['OCR']['dpi']),
         'psm': cfg['OCR'].getint('psm', fallback=OCR_PSM_DEFAULT),
         'o_zero_aspect': cfg['OCR'].getfloat('o_zero_aspect', fallback=O_ZERO_ASPECT_DEFAULT),
+        'o_zero_banda': cfg['OCR'].getfloat('o_zero_banda', fallback=O_ZERO_BANDA_DEFAULT),
         'min_confidence': cfg['OCR'].getfloat('min_confidence', fallback=OCR_MIN_CONFIDENCE_DEFAULT),
         'log_forme': cfg['OCR'].getboolean('log_forme', fallback=False),
     }
@@ -1410,6 +1586,14 @@ def run() -> int:
         'max_length': int(cfg['Filename']['max_length']),
         'remove_leading_zeros': cfg['Filename'].getboolean('remove_leading_zeros'),
     }
+
+    # [Aggiornamenti] è opzionale e senza prompt, come show_rects: il token del
+    # repository privato si aggiunge a mano. Senza token non si controlla nulla.
+    token_aggiornamenti = cfg.get('Aggiornamenti', 'token', fallback='').strip()
+    aggiornamenti_attivi = cfg.getboolean('Aggiornamenti', 'attivo', fallback=True)
+    print(f"ℹ️ CMR Renamer {__version__}")
+    if _is_frozen():
+        aggiornamento.pulisci_residui(sys.executable)
 
     # ----------------------------------------------------------
     # Process existing files on startup
@@ -1442,26 +1626,53 @@ def run() -> int:
 
     tray_icon = None
     stop_event = threading.Event()
+    riavvio = {'tag': None}
+
+    aggiornatore = None
+    if not _is_frozen():
+        print("ℹ️ Aggiornamento automatico non attivo: esecuzione da sorgente.")
+    elif not aggiornamenti_attivi:
+        print("ℹ️ Aggiornamento automatico disattivato in config.ini.")
+    elif not token_aggiornamenti:
+        print("ℹ️ Aggiornamento automatico non attivo: manca 'token' nella sezione [Aggiornamenti] di config.ini.")
+    else:
+        def al_riavvio(tag):
+            # Il nuovo exe è già al suo posto: si ferma tutto in modo ordinato
+            # (observer.join aspetta il file in elaborazione) e lo si avvia alla fine.
+            riavvio['tag'] = tag
+            if tray_icon is not None:
+                tray_icon.stop()
+            stop_event.set()
+
+        aggiornatore = aggiornamento.Aggiornatore(token_aggiornamenti, sys.executable, al_riavvio)
+        aggiornatore.avvia_periodico(stop_event)
+
     if _is_frozen() and PYSTRAY_AVAILABLE:
         try:
             icon_image = Image.open(_get_resource_path(os.path.join('assets', 'icon.ico')))
             log_path = os.path.join(config_dir, 'cmr-renamer.log')
-            tray_icon = _build_tray_icon(icon_image, ocr_cfg, name_cfg, log_path, cartella, stop_event)
+            tray_icon = _build_tray_icon(icon_image, ocr_cfg, name_cfg, log_path, cartella, stop_event,
+                                         aggiornatore)
             threading.Thread(target=tray_icon.run, daemon=True).start()
         except Exception as e:
             print(f"⚠️ Icona di system tray non disponibile: {e}")
             tray_icon = None
 
     try:
-        if tray_icon is not None:
-            stop_event.wait()
-        else:
-            while True:
-                time.sleep(1)
+        # wait() a intervalli, non senza timeout: così Ctrl+C resta reattivo
+        # anche da console, e il riavvio per aggiornamento funziona senza tray.
+        while not stop_event.wait(1):
+            pass
     except KeyboardInterrupt:
         print("\n🛑 Arresto...")
 
     observer.stop()
     observer.join()
+    if riavvio['tag']:
+        print(f"🔄 Riavvio sulla {riavvio['tag']}...")
+        try:
+            aggiornamento.riavvia(sys.executable)
+        except Exception as e:
+            print(f"❌ Riavvio non riuscito ({e}): avvia di nuovo CMR Renamer a mano.")
     print("👋 Monitoraggio terminato.")
     return 0
