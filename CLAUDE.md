@@ -24,11 +24,20 @@ uv run cmr-renamer            # equivalent, via the installed console script
 uv run -- pyinstaller cmr-renamer.spec
 ```
 
-`cmr-renamer.spec` is the old `--onefile --windowed --add-data ...` command line plus a filter that
-drops the Qt files this program never loads — the software OpenGL renderer (`opengl32sw.dll`, 20 MB),
-ANGLE, all Qt translations and every plugin family except `platforms` and `styles` — and excludes
-`tkinter` and `PySide6.QtNetwork`. If a new Qt feature needs one of those (an image-format plugin,
-say), widen `QT_PLUGIN_TENUTI` rather than reaching for the command line.
+`cmr-renamer.spec` is the old `--onefile --windowed --add-data ...` command line plus a filter
+(`_serve`) that drops what this program never loads:
+- **Duplicates of `vendor/` at the archive root** — the biggest item. PyInstaller reclassifies the
+  DLLs under `vendor/` as binaries and collects their dependencies a second time at the root: 46
+  byte-identical copies, 15.7 MB compressed / 40 MB extracted per launch in v3.2.0 and every earlier
+  build. Nothing loads them: `tesseract.exe` and `pdftoppm.exe` resolve DLLs from their own folders.
+- **Unused Qt**: the software OpenGL renderer (`opengl32sw.dll`, 20 MB), ANGLE, all translations,
+  `Qt6Network`/`Qt6Svg` (dependencies of dropped plugins only) and every plugin except `qwindows` and
+  the native style (`QT_PLUGIN_TENUTI`).
+- Pillow's AVIF codec, plus `tkinter` and `PySide6.QtNetwork` via `excludes`.
+
+If a new Qt feature needs a dropped file (an image-format plugin, say), widen `QT_PLUGIN_TENUTI`
+rather than going back to the command line. A release is signed only after checking the CI exe (see
+"Releasing"), so a filter that drops something needed never reaches the updater.
 
 There is no test suite, linter, or formatter configured in this repo — don't assume `pytest`/`ruff`
 exist. Poppler and Tesseract are vendored under `vendor/` (via Git LFS) and bundled into the built
