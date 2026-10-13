@@ -196,6 +196,32 @@ def _pulisci_nome(testo: str, max_len: int, rimuovi_zeri: bool) -> str:
     return clean
 
 
+RENDER_TENTATIVI = 3
+RENDER_ATTESA_S = 5
+
+
+def _render_con_riprova(path: str, dpi: int) -> "Image.Image | None":
+    """`_render_pdf_page` ritentato se il file è ancora bloccato; None se il file non c'è più.
+
+    Un PDF appena arrivato su una condivisione può essere ancora aperto in
+    esclusiva da chi lo scrive anche dopo `_file_pronto`. Se invece il file è
+    sparito (già rinominato per un evento precedente, o spostato), non è un errore.
+    """
+    for tentativo in range(1, RENDER_TENTATIVI + 1):
+        if not os.path.exists(path):
+            return None
+        try:
+            return _render_pdf_page(path, dpi)
+        except Exception as e:
+            if not os.path.exists(path):
+                return None
+            if tentativo == RENDER_TENTATIVI:
+                raise
+            print(f"⏳ '{os.path.basename(path)}' non ancora leggibile ({str(e).splitlines()[0]}): "
+                  f"riprovo tra {RENDER_ATTESA_S} s ({tentativo}/{RENDER_TENTATIVI}).")
+            time.sleep(RENDER_ATTESA_S)
+
+
 def _render_pdf_page(path: str, dpi: int) -> "Image.Image":
     """Renderizza la pagina 1 di un PDF come immagine PIL."""
     immagini = convert_from_path(
@@ -332,7 +358,11 @@ def _componenti_scure(px, larghezza: int, altezza: int, semi: tuple) -> list:
 
 
 def _misura_glifo(img: "Image.Image", bbox: "tuple | None") -> tuple:
-    """(larghezza, altezza) del glifo misurate sull'inchiostro dell'immagine binarizzata.
+    """(larghezza, altezza, ripiego) del glifo, misurate sull'inchiostro dell'immagine binarizzata.
+
+    `ripiego` è None quando la misura viene dall'inchiostro, altrimenti dice perché
+    si è tornati al box di Tesseract: con `log_forme` finisce nel log, ed è l'unico
+    modo di capire sul campo se la misura sull'inchiostro sta lavorando.
 
     Il box per carattere di Tesseract serve solo a dire *dove* sta il glifo: la
     misura si fa sui pixel scuri attorno, cercati con un margine (`GLIFO_MARGINE_X/Y`)
@@ -347,25 +377,25 @@ def _misura_glifo(img: "Image.Image", bbox: "tuple | None") -> tuple:
     il rapporto).
     """
     if bbox is None:
-        return (0, 0)
+        return (0, 0, "nessun box")
     x0, y0, x1, y1 = bbox
     larghezza_box, altezza_box = x1 - x0, y1 - y0
     if larghezza_box <= 0 or altezza_box <= 0:
-        return (0, 0)
+        return (0, 0, "box vuoto")
 
     mx = max(1, round(altezza_box * GLIFO_MARGINE_X))
     my = max(1, round(altezza_box * GLIFO_MARGINE_Y))
     rx0, ry0 = max(0, x0 - mx), max(0, y0 - my)
     rx1, ry1 = min(img.width, x1 + mx), min(img.height, y1 + my)
     if rx1 <= rx0 or ry1 <= ry0:
-        return (larghezza_box, altezza_box)
+        return (larghezza_box, altezza_box, "box fuori dall'immagine")
     regione = img.crop((rx0, ry0, rx1, ry1)).convert('L')
     w, h = regione.size
     semi = (x0 - rx0, y0 - ry0, min(w, x1 - rx0), min(h, y1 - ry0))
 
     componenti = _componenti_scure(regione.load(), w, h, semi)
     if not componenti:
-        return (larghezza_box, altezza_box)
+        return (larghezza_box, altezza_box, "nessun inchiostro nel box")
 
     principale = max(componenti, key=lambda c: c['dentro'])
     pw = principale['bbox'][2] - principale['bbox'][0] + 1
@@ -380,12 +410,17 @@ def _misura_glifo(img: "Image.Image", bbox: "tuple | None") -> tuple:
             gx0, gy0 = min(gx0, c['bbox'][0]), min(gy0, c['bbox'][1])
             gx1, gy1 = max(gx1, c['bbox'][2]), max(gy1, c['bbox'][3])
 
-    tocca_bordo = (gx0 == 0 and rx0 > 0) or (gx1 == w - 1 and rx1 < img.width) \
-        or (gy0 == 0 and ry0 > 0) or (gy1 == h - 1 and ry1 < img.height)
-    misura = (gx1 - gx0 + 1, gy1 - gy0 + 1)
-    if tocca_bordo or misura[1] < altezza_box * 0.5:
-        return (larghezza_box, altezza_box)
-    return misura
+    bordi = [nome for nome, tocca in (
+        ("sinistra", gx0 == 0 and rx0 > 0), ("destra", gx1 == w - 1 and rx1 < img.width),
+        ("sopra", gy0 == 0 and ry0 > 0), ("sotto", gy1 == h - 1 and ry1 < img.height),
+    ) if tocca]
+    larghezza, altezza = gx1 - gx0 + 1, gy1 - gy0 + 1
+    if bordi:
+        return (larghezza_box, altezza_box,
+                f"inchiostro fuso oltre il margine a {'/'.join(bordi)} ({larghezza}x{altezza})")
+    if altezza < altezza_box * 0.5:
+        return (larghezza_box, altezza_box, f"inchiostro troppo basso ({larghezza}x{altezza})")
+    return (larghezza, altezza, None)
 
 
 def _misura_wconf(title: "str | None") -> "float | None":
@@ -592,14 +627,22 @@ def _ocr_box(crop: "Image.Image", ocr_cfg: dict) -> dict:
 
     # Si misurano solo i glifi ambigui: gli altri servono a _correggi_o_zero
     # unicamente per il controllo di allineamento.
-    glifi = [
-        (ch, *_misura_glifo(crop, bbox)) if ch in _GLIFI_O_ZERO else (ch, 0, 0)
-        for ch, bbox in risultato['glifi']
-    ]
+    log_forme = ocr_cfg.get('log_forme', False)
+    glifi = []
+    for ch, bbox in risultato['glifi']:
+        if ch not in _GLIFI_O_ZERO:
+            glifi.append((ch, 0, 0))
+            continue
+        larghezza, altezza, ripiego = _misura_glifo(crop, bbox)
+        if log_forme and bbox is not None:
+            box_txt = f"box Tesseract {bbox[2] - bbox[0]}x{bbox[3] - bbox[1]}"
+            print(f"   glifo '{ch}': {box_txt}, " + (
+                f"inchiostro {larghezza}x{altezza}" if ripiego is None else f"uso il box: {ripiego}"))
+        glifi.append((ch, larghezza, altezza))
     testo = _correggi_o_zero(
         risultato['testo'], glifi,
         ocr_cfg.get('o_zero_aspect', O_ZERO_ASPECT_DEFAULT),
-        ocr_cfg.get('log_forme', False),
+        log_forme,
         ocr_cfg.get('o_zero_banda', O_ZERO_BANDA_DEFAULT),
     )
     confidenze = risultato['confidenze']
@@ -770,18 +813,35 @@ def _detect_content_anchor(img: "Image.Image") -> "tuple[int, int] | None":
     return (anchor_x, anchor_y)
 
 
-def _file_pronto(path: str, timeout: int = 5) -> bool:
-    """Aspetta che il file sia finito di scrivere dalla fotocopiatrice."""
-    try:
-        for _ in range(timeout):
-            size1 = os.path.getsize(path)
-            time.sleep(1)
-            size2 = os.path.getsize(path)
-            if size1 == size2:
+FILE_PRONTO_TIMEOUT_S = 30
+
+
+def _file_pronto(path: str, timeout: int = FILE_PRONTO_TIMEOUT_S) -> bool:
+    """Aspetta che il file sia finito di scrivere dalla fotocopiatrice.
+
+    Pronto = dimensione non vuota e ferma per un secondo, *e* apribile in lettura.
+    Su una condivisione SMB la sola dimensione non basta: chi scrive può tenere il
+    file aperto in esclusiva anche a dimensione ferma, e Poppler fallisce allora
+    con "Couldn't open file ... No error". False se il file sparisce o al timeout.
+    """
+    scadenza = time.monotonic() + timeout
+    precedente = None
+    while True:
+        try:
+            dimensione = os.path.getsize(path)
+        except OSError:
+            return False  # sparito: rinominato o spostato da qualcun altro
+        if dimensione > 0 and dimensione == precedente:
+            try:
+                with open(path, 'rb') as f:
+                    f.read(1)
                 return True
-        return False
-    except OSError:
-        return False
+            except OSError:
+                pass  # ancora bloccato da chi lo scrive
+        precedente = dimensione
+        if time.monotonic() >= scadenza:
+            return False
+        time.sleep(1)
 
 
 MIN_BOXES = 2
@@ -1373,10 +1433,30 @@ def _resolve_crop_boxes(img: "Image.Image", ocr_cfg: dict) -> list:
     return [(x1 + dx, y1 + dy, x2 + dx, y2 + dy) for (x1, y1, x2, y2) in boxes]
 
 
+def _salva_ritaglio_debug(crop: "Image.Image", pdf_path: str, indice: int) -> None:
+    """Con `log_forme`, salva il ritaglio esattamente come lo riceve Tesseract.
+
+    In `debug_ocr/` accanto a config.ini, un PNG per box e per file: è ciò che serve
+    per capire un errore di lettura senza avere accesso alle scansioni originali.
+    """
+    try:
+        cartella = os.path.join(_get_config_dir(), 'debug_ocr')
+        os.makedirs(cartella, exist_ok=True)
+        base = os.path.splitext(os.path.basename(pdf_path))[0]
+        percorso = os.path.join(cartella, f"{base}_box{indice}.png")
+        crop.save(percorso)
+        print(f"   🖼️ ritaglio box {indice} salvato in {percorso}")
+    except Exception as e:
+        print(f"⚠️ Impossibile salvare il ritaglio di debug: {e}")
+
+
 def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
     """Esegue OCR e rinomina il PDF con il testo estratto."""
     try:
-        img = _render_pdf_page(pdf_path, ocr_cfg['dpi'])
+        img = _render_con_riprova(pdf_path, ocr_cfg['dpi'])
+        if img is None:
+            print(f"ℹ️ '{os.path.basename(pdf_path)}' non c'è più (già rinominato o spostato): niente da fare.")
+            return
 
         serve_calibrazione = len(ocr_cfg['boxes']) < MIN_BOXES
         if ocr_cfg['show_rects'] or serve_calibrazione:
@@ -1408,6 +1488,8 @@ def _rinomina_pdf(pdf_path: str, ocr_cfg: dict, name_cfg: dict) -> None:
         soglia_conf = ocr_cfg.get('min_confidence', OCR_MIN_CONFIDENCE_DEFAULT)
         for i, box in enumerate(_resolve_crop_boxes(img, ocr_cfg), start=1):
             crop = _preprocess_for_ocr(img.crop(box))
+            if ocr_cfg.get('log_forme'):
+                _salva_ritaglio_debug(crop, pdf_path, i)
             letto = _ocr_box(crop, ocr_cfg)
             conf = letto['confidenza_min']
             if conf is not None and conf < soglia_conf:
@@ -1481,9 +1563,14 @@ class CMRHandler(FileSystemEventHandler):
             return
         self.processati[path] = now
 
+        if not os.path.exists(path):
+            # Evento arrivato in coda dopo che il file era già stato rinominato.
+            return
         print(f"⏳ Attendo: {os.path.basename(path)}")
         if not _file_pronto(path):
-            print(f"⚠️ Timeout attesa: {os.path.basename(path)}")
+            if not os.path.exists(path):
+                return
+            print(f"⚠️ Timeout attesa: {os.path.basename(path)} — provo comunque.")
         print(f"✔ Elaboro: {path}")
         _rinomina_pdf(path, self.ocr_cfg, self.name_cfg)
 

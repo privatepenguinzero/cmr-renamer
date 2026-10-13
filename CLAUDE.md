@@ -158,7 +158,15 @@ it searches the binarized crop within a margin (`GLIFO_MARGINE_X/Y`) and measure
 components (`_componenti_scure`, pure-Python BFS, no numpy) that sit mostly inside the box — merging
 the pieces of an `O` broken by binarization, while excluding the period of "D.O.O." and neighboring
 glyphs. It falls back to Tesseract's box when the ink touches the search region's edge (glyph fused
-with a neighbor) or is less than half the box height. Only `O`/`o`/`0` glyphs are measured.
+with a neighbor) or is less than half the box height, and returns *why* as its third value. Only
+`O`/`o`/`0` glyphs are measured.
+
+**`log_forme = true` is the field diagnostic**, since no real scan is available in development. Per
+O/0 glyph it logs Tesseract's box size and either the ink size or the fallback reason (`glifo 'O':
+box Tesseract 19x31, uso il box: inchiostro fuso oltre il margine a destra (...)`), then the decision
+with `[forma]`/`[contesto]`; `_salva_ritaglio_debug` also saves every preprocessed crop, exactly as
+Tesseract receives it, to `debug_ocr/<pdf>_box<N>.png` next to `config.ini`. Identical ratios before
+and after a change to the measurement mean it is falling back — read the reason before retuning.
 
 **Context decides only in the uncertain band.** `_correggi_o_zero` decides by shape, except when the
 ratio falls within `o_zero_banda` of `o_zero_aspect`: there `_tipo_da_contesto` looks at the nearest
@@ -206,10 +214,14 @@ write errors: the rename already happened, and failing the file because it could
 would be a worse cure than the disease.
 
 **Watching**: `CMRHandler` (a `watchdog` `FileSystemEventHandler`) reacts to created/moved/modified
-events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to stop
-growing (`_file_pronto`, since files typically arrive from a scanner/copier still being written), then
-calls `_rinomina_pdf`. A `processati` dict debounces repeat events per path using `delay_riavvio` from
-config. `run()` also sweeps the watched folder for pre-existing matching files once at startup, before
+events, filters to `*.pdf` files starting with the configured `prefix`, waits for the file to be ready
+(`_file_pronto`, up to `FILE_PRONTO_TIMEOUT_S`: size non-zero and unchanged for a second *and* openable
+for reading — on the SMB share a copier can hold the file exclusively at a stable size, and Poppler
+then fails with "Couldn't open file ... No error"), then calls `_rinomina_pdf`. A `processati` dict
+debounces repeat events per path using `delay_riavvio` from config. Events are dispatched serially,
+so one for a path that an earlier event already renamed is common: both `_processa` and
+`_rinomina_pdf` treat a missing file as nothing to do (an info line, not an `❌`), and
+`_render_con_riprova` retries the render `RENDER_TENTATIVI` times while the file still exists. `run()` also sweeps the watched folder for pre-existing matching files once at startup, before
 starting the observer loop.
 
 **Background mode UI**: when frozen and running in background mode, a system tray icon
