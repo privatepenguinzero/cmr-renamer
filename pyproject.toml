@@ -9,7 +9,7 @@ dependencies = [
     "pillow",
     "pytesseract",
     "pdf2image",
-    "pystray",
+    "PySide6-Essentials>=6.7",
 ]
 
 [project.scripts]

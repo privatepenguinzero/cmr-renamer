@@ -30,7 +30,7 @@ page, then renames the file for you — no manual typing, no manual filing.
    uv sync
    ```
 
-   This installs `watchdog`, `pillow`, `pytesseract`, `pdf2image`, and `pystray`.
+   This installs `watchdog`, `pillow`, `pytesseract`, `pdf2image`, and `PySide6-Essentials` (Qt).
 
 2. **Configure**:
    - Run `python main.py`. If `config.ini` is missing, you'll be prompted to select the folder to
@@ -83,7 +83,7 @@ everyone who builds and maintains them:
   and publishing the Windows installers this project's bundle is built from.
 - The maintainers of [watchdog](https://github.com/gorakhargosh/watchdog), [Pillow](https://python-pillow.org/),
   [pytesseract](https://github.com/madmaze/pytesseract), [pdf2image](https://github.com/Belval/pdf2image),
-  and [pystray](https://github.com/moses-palmer/pystray) — the Python ecosystem this tool is built
+  and [Qt for Python](https://doc.qt.io/qtforpython-6/) — the Python ecosystem this tool is built
   entirely out of.
 
 ## License

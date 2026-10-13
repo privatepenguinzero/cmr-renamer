@@ -21,8 +21,14 @@ python -m cmr_renamer         # equivalent, via __main__.py
 uv run cmr-renamer            # equivalent, via the installed console script
 
 # Build the Windows executable locally (mirrors .github/workflows/build_release.yml)
-uv run -- pyinstaller --onefile --windowed --name cmr-renamer --icon=assets/icon.ico --add-data "assets/icon.ico;assets" --add-data "vendor/poppler;vendor/poppler" --add-data "vendor/tesseract;vendor/tesseract" main.py
+uv run -- pyinstaller cmr-renamer.spec
 ```
+
+`cmr-renamer.spec` is the old `--onefile --windowed --add-data ...` command line plus a filter that
+drops the Qt files this program never loads — the software OpenGL renderer (`opengl32sw.dll`, 20 MB),
+ANGLE, all Qt translations and every plugin family except `platforms` and `styles` — and excludes
+`tkinter` and `PySide6.QtNetwork`. If a new Qt feature needs one of those (an image-format plugin,
+say), widen `QT_PLUGIN_TENUTI` rather than reaching for the command line.
 
 There is no test suite, linter, or formatter configured in this repo — don't assume `pytest`/`ruff`
 exist. Poppler and Tesseract are vendored under `vendor/` (via Git LFS) and bundled into the built
@@ -46,11 +52,11 @@ top-level behavior in `watcher.run()` so all three entry points stay in sync aut
 event handler (`CMRHandler`) all live here. Frozen-vs-source and interactive-vs-background execution
 are all branched inside `run()`:
 - Not frozen (running from source): behaves like a normal console script.
-- Frozen + no `config.ini`, `tkinter` unavailable: allocates a Windows console
+- Frozen + no `config.ini`, Qt unavailable (`gui.puo_avviarsi()`): allocates a Windows console
   (`_alloc_console`/`_free_console`, via `ctypes.windll.kernel32`) so the interactive console
   setup prompts are visible, then frees it and switches to file logging (`_setup_file_logging`
   redirects `sys.stdout`/`stderr` to `cmr-renamer.log`) for normal background operation.
-- Frozen + no `config.ini`, `tkinter` available: no console at all — `_setup_file_logging` runs
+- Frozen + no `config.ini`, Qt available: no console at all — `_setup_file_logging` runs
   first (a `--windowed` build with no console has `sys.stdout`/`stderr` as `None`, so anything
   printed before logging is set up would crash), then `load_or_create_config` shows the GUI setup
   form directly.
@@ -59,7 +65,7 @@ are all branched inside `run()`:
 
 **Config lives next to the executable (or CWD when running from source)**, in `config.ini`, and is
 created interactively on first run by `config.py` (`load_or_create_config`). It prefers a single
-Tkinter form (`_prompt_with_gui`) covering every setting — folder (with a "Sfoglia..." button
+Qt dialog (`_prompt_with_gui`) covering every setting — folder (with a "Sfoglia..." button
 reusing the same `askdirectory` picker), prefix, delay, OCR language (checkboxes for the bundled
 `eng`/`ita`/`deu` plus a free-text field for extra codes, joined with `+` via `_build_lang_string`),
 dpi, max filename length, and the leading-zeros checkbox — all three languages are checked by default
@@ -69,7 +75,7 @@ the first language as primary, and on a real CMR (verified on the user's machine
 The old builder put `eng` first, so existing `config.ini` files need `lang` reordered by hand; `run()`
 logs the configured languages at startup so this is visible in the field — validating delay/dpi/max_length as
 positive integers (`_parse_positive_int`) and requiring at least one language before saving.
-Falls back to the original per-field console prompts if `tkinter` is unavailable or the form is
+Falls back to the original per-field console prompts if Qt is unavailable or the form is
 closed without saving.
 Config sections: `[Watcher]` (folder, prefix, delay_riavvio), `[OCR]` (box1..box5 crop coordinates
 for 2-5 boxes, anchor_x/anchor_y content-anchor reference, show_rects debug flag, lang, dpi, psm,
@@ -114,7 +120,8 @@ appended to `rinomine.log` (see "Rename journal" below). Before OCR, `_rinomina_
 whenever fewer than `MIN_BOXES` are configured (first PDF ever processed — the calibrator is
 mandatory then, and cancelling skips that file rather than cropping garbage) or whenever
 `show_rects` is `True` in `config.ini` (opt-in recalibration). `_calibra_box(pdf_paths, initial_path,
-boxes, ocr_cfg, name_cfg)` opens a Tk window with the rendered page on a scrollable/zoomable `Canvas` (mouse wheel
+boxes, ocr_cfg, name_cfg)` renders the page on the calling thread, then opens `_finestra_calibrazione` on the GUI
+thread: a Qt dialog with the page in a `_PaginaCalibrazione` widget inside a `QScrollArea` (mouse wheel
 or +/− buttons, scaled around a `base_scale` fit-to-screen and clamped by `MAX_ZOOM`/`MAX_DIM`),
 plus a sidebar `Listbox` of every PDF in the watched folder (`_list_watched_pdfs`, sorted
 alphabetically, `initial_path` preselected) so box placement can be checked live against multiple
@@ -216,7 +223,7 @@ than only in memory is what lets the tray's "Annulla ultime rinomine" work after
 A), skips any entry whose current file is gone or whose original name is taken, and appends a
 `{tipo: "undo"}` marker so a second click is a no-op. A partial undo with an honest count beats one
 that stops halfway leaving inconsistent state — hence the skipping rather than aborting. It asks for
-confirmation through `messagebox.askyesno` when `tkinter` is available: it renames files on a network
+confirmation through `gui.chiedi_conferma` when a GUI is available: it renames files on a network
 share and a tray menu entry is easy to hit by accident. `_registra_rinomina` swallows and logs its own
 write errors: the rename already happened, and failing the file because it could not be journalled
 would be a worse cure than the disease.
@@ -233,8 +240,8 @@ so one for a path that an earlier event already renamed is common: both `_proces
 starting the observer loop.
 
 **Background mode UI**: when frozen and running in background mode, a system tray icon
-(`pystray`, guarded the same way as the `tkinter` import — missing `pystray` just means no tray,
-not a crash) offers "Apri log", "Apri cartella monitorata", "Ricalibra box" (scans the watched
+(`QSystemTrayIcon`, built by `_build_tray_icon` — no Qt or no notification area just means no
+tray, not a crash) offers "Apri log", "Apri cartella monitorata", "Ricalibra box" (scans the watched
 folder for PDFs via `_list_watched_pdfs`, the same way mandatory first-run calibration does, and
 opens the same `_calibra_box` calibrator against that list — no file picker; an empty folder just
 prints a warning and does nothing), and "Esci". This is the only way
@@ -242,6 +249,24 @@ to exit a frozen+windowed instance, since it has no console/Ctrl+C available. Lo
 background mode goes through `_RotatingWriter`, which caps `cmr-renamer.log` at ~1MB with one
 backup (`cmr-renamer.log.1`) instead of growing unbounded. The menu also shows the running version
 (disabled item) and, when the updater is active, "Controlla aggiornamenti".
+
+**GUI threading model** (`gui.py`, Qt via `PySide6-Essentials`): Qt widgets may only be touched on
+the thread that created the `QApplication`, the main thread, while this program's work happens on
+watchdog, updater and worker threads. So `run()` creates the app (`gui.applicazione()`, after file
+logging and the setup form), runs the startup sweep and starts the observer on a `monitoraggio`
+worker thread, and keeps the main thread in `gui.ciclo_eventi(stop_event)` — `app.exec()` plus a
+200 ms timer that quits once `stop_event` is set (Esci, an update restart, or Ctrl+C, whose handler
+is installed with `signal.signal` because a C++ event loop would otherwise hold `KeyboardInterrupt`
+back). Anything GUI from another thread goes through `gui.esegui_in_gui(fn, ...)`, which queues `fn`
+onto the main thread and waits for its result or exception — `_calibra_box`, `gui.mostra_info`,
+`gui.chiedi_conferma`, `gui.scegli_cartella` all do. Two invariants keep shutdown from hanging:
+`esegui_in_gui` returns `None` once the loop has ended (`gui._chiuso`), so a worker waiting on a
+calibrator cannot block `run()`'s `join`; and the sweep checks `stop_event` between files. Tray
+actions run *on* the GUI thread, so slow ones (update check, undo on the network share) hand off to a
+thread. Without Qt or without a display (`_display_presente`: Qt aborts the process rather than
+raising on a headless Linux box) `run()` falls back to the old `stop_event.wait(1)` loop and there is
+simply no tray or calibrator. Images reach Qt as raw RGBA via `gui.da_pil`, never through Qt's own
+decoders, which is what lets the spec drop the image-format plugins.
 
 **Auto-update** (`aggiornamento.py`, GUI-free; `run()` wires it in): same protocol as offerte-gen's
 C# launcher, reimplemented in Python inside the app because this is a `--onefile` exe on a single PC.
@@ -261,7 +286,7 @@ from the tray:
   constants in the module. Only then: `<exe>` → `<exe>.old` (Windows allows renaming a running exe),
   `.new` → `<exe>`, rolling back the first rename if the second fails. `.old` is deleted at the next
   start (`pulisci_residui`).
-- `al_riavvio` stops the tray and sets `stop_event`; `run()` then stops the observer (`join` waits
+- `al_riavvio` sets `stop_event`; the Qt loop quits, and `run()` then stops the observer (`join` waits
   for the file being processed) and launches the new exe with `PYINSTALLER_RESET_ENVIRONMENT=1` —
   without it a `--onefile` child would reuse this process's `_MEI` temp dir, which is deleted on exit.
 - The token expiry (`github-authentication-token-expiration` header) is reported when ≤ 30 days.

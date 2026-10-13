@@ -7,12 +7,14 @@ import os
 import sys
 import configparser
 
-try:
-    from tkinter import Tk, Frame, Label, Entry, Button, Checkbutton, BooleanVar, StringVar
-    from tkinter.filedialog import askdirectory
-    TKINTER_AVAILABLE = True
-except ImportError:
-    TKINTER_AVAILABLE = False
+from . import gui
+
+if gui.QT_AVAILABLE:
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import (
+        QCheckBox, QDialog, QDialogButtonBox, QGridLayout, QHBoxLayout, QLabel,
+        QLineEdit, QPushButton,
+    )
 
 
 def _prompt_console(prompt_text, default=None):
@@ -53,12 +55,9 @@ def _build_lang_string(eng: bool, ita: bool, deu: bool, extra: str) -> str:
 
 def _prompt_for_folder():
     """Prompt user to select a folder using GUI if available, else console."""
-    if TKINTER_AVAILABLE:
+    if gui.applicazione() is not None:
         try:
-            root = Tk()
-            root.withdraw()
-            folder = askdirectory(title="Seleziona la cartella da monitorare")
-            root.destroy()
+            folder = gui.scegli_cartella("Seleziona la cartella da monitorare")
             if folder:
                 return folder
             print("Nessuna cartella selezionata. Inserisci il percorso manualmente.")
@@ -69,120 +68,115 @@ def _prompt_for_folder():
 
 
 def _prompt_with_gui() -> "dict | None":
-    """Mostra un'unica finestra Tkinter con tutti i campi di configurazione iniziale.
+    """Mostra un'unica finestra Qt con tutti i campi di configurazione iniziale.
 
     Ritorna un dict con le stesse chiavi che load_or_create_config scrive in config.ini (tutti
-    valori stringa), oppure None se tkinter non è disponibile o la finestra viene chiusa senza
+    valori stringa), oppure None se Qt non è disponibile o la finestra viene chiusa senza
     salvare — in quel caso il chiamante ricade sui prompt a console.
     """
-    if not TKINTER_AVAILABLE:
+    if gui.applicazione() is None:
         return None
 
-    result = {'value': None}
-
     try:
-        root = Tk()
-        root.title("CMR Renamer - Configurazione Iniziale")
+        dialogo = QDialog()
+        dialogo.setWindowTitle("CMR Renamer - Configurazione Iniziale")
+        griglia = QGridLayout(dialogo)
 
-        folder_var = StringVar(value="")
-        prefix_var = StringVar(value="DOC")
-        delay_var = StringVar(value="3")
-        dpi_var = StringVar(value="300")
-        max_length_var = StringVar(value="60")
-        extra_lang_var = StringVar(value="")
-        eng_var = BooleanVar(value=True)
+        folder_edit = QLineEdit()
+        folder_edit.setMinimumWidth(320)
+        prefix_edit = QLineEdit("DOC")
+        delay_edit = QLineEdit("3")
+        dpi_edit = QLineEdit("300")
+        max_length_edit = QLineEdit("60")
+        extra_lang_edit = QLineEdit()
         # Tutte e tre sono incluse nell'exe. Il solo "eng" leggeva "d.o.o." come
         # "4.0.0." (confidenza 45) su un CMR reale, dove "ita" legge la "d" giusta.
-        ita_var = BooleanVar(value=True)
-        deu_var = BooleanVar(value=True)
-        remove_zeros_var = BooleanVar(value=True)
+        eng_check = QCheckBox("eng")
+        ita_check = QCheckBox("ita")
+        deu_check = QCheckBox("deu")
+        remove_zeros_check = QCheckBox("Rimuovi zeri iniziali dai numeri")
+        for check in (eng_check, ita_check, deu_check, remove_zeros_check):
+            check.setChecked(True)
 
         def browse_folder():
-            chosen = askdirectory(title="Seleziona la cartella da monitorare")
+            chosen = gui.scegli_cartella("Seleziona la cartella da monitorare", folder_edit.text())
             if chosen:
-                folder_var.set(chosen)
+                folder_edit.setText(chosen)
 
-        row = 0
-        Label(root, text="Cartella da monitorare:").grid(row=row, column=0, sticky="w", padx=8, pady=4)
-        Entry(root, textvariable=folder_var, width=40).grid(row=row, column=1, padx=8, pady=4)
-        Button(root, text="Sfoglia...", command=browse_folder).grid(row=row, column=2, padx=8, pady=4)
+        sfoglia = QPushButton("Sfoglia...")
+        sfoglia.clicked.connect(browse_folder)
+
+        lang_riga = QHBoxLayout()
+        for check in (eng_check, ita_check, deu_check):
+            lang_riga.addWidget(check)
+        lang_riga.addStretch(1)
+
+        righe = [
+            ("Cartella da monitorare:", folder_edit),
+            ("Prefisso file (es. DOC):", prefix_edit),
+            ("Delay tra rilevamenti (secondi):", delay_edit),
+            ("Lingua OCR:", lang_riga),
+            ("Altre lingue (es. fra, separate da +):", extra_lang_edit),
+            ("DPI per conversione PDF:", dpi_edit),
+            ("Lunghezza massima per parte del nome file:", max_length_edit),
+        ]
+        for row, (testo, campo) in enumerate(righe):
+            griglia.addWidget(QLabel(testo), row, 0)
+            if isinstance(campo, QHBoxLayout):
+                griglia.addLayout(campo, row, 1)
+            else:
+                griglia.addWidget(campo, row, 1)
+        griglia.addWidget(sfoglia, 0, 2)
+        row = len(righe)
+        griglia.addWidget(remove_zeros_check, row, 0, 1, 3)
         row += 1
 
-        Label(root, text="Prefisso file (es. DOC):").grid(row=row, column=0, sticky="w", padx=8, pady=4)
-        Entry(root, textvariable=prefix_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
+        error_label = QLabel("")
+        error_label.setStyleSheet("color: #b00020;")
+        griglia.addWidget(error_label, row, 0, 1, 3)
         row += 1
 
-        Label(root, text="Delay tra rilevamenti (secondi):").grid(row=row, column=0, sticky="w", padx=8, pady=4)
-        Entry(root, textvariable=delay_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
-        row += 1
+        pulsanti = QDialogButtonBox()
+        conferma = pulsanti.addButton("Conferma", QDialogButtonBox.AcceptRole)
+        conferma.setDefault(True)
+        griglia.addWidget(pulsanti, row, 0, 1, 3, Qt.AlignCenter)
 
-        Label(root, text="Lingua OCR:").grid(row=row, column=0, sticky="nw", padx=8, pady=4)
-        lang_frame = Frame(root)
-        lang_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
-        Checkbutton(lang_frame, text="eng", variable=eng_var).pack(side="left")
-        Checkbutton(lang_frame, text="ita", variable=ita_var).pack(side="left")
-        Checkbutton(lang_frame, text="deu", variable=deu_var).pack(side="left")
-        row += 1
-
-        Label(root, text="Altre lingue (es. fra, separate da +):").grid(row=row, column=0, sticky="w", padx=8, pady=4)
-        Entry(root, textvariable=extra_lang_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
-        row += 1
-
-        Label(root, text="DPI per conversione PDF:").grid(row=row, column=0, sticky="w", padx=8, pady=4)
-        Entry(root, textvariable=dpi_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
-        row += 1
-
-        Label(root, text="Lunghezza massima per parte del nome file:").grid(row=row, column=0, sticky="w", padx=8, pady=4)
-        Entry(root, textvariable=max_length_var, width=40).grid(row=row, column=1, columnspan=2, sticky="w", padx=8, pady=4)
-        row += 1
-
-        Checkbutton(root, text="Rimuovi zeri iniziali dai numeri", variable=remove_zeros_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=8, pady=4
-        )
-        row += 1
-
-        error_label = Label(root, text="", fg="red")
-        error_label.grid(row=row, column=0, columnspan=3, sticky="w", padx=8, pady=4)
-        row += 1
+        result = {'value': None}
 
         def on_confirm():
-            delay = _parse_positive_int(delay_var.get())
-            dpi = _parse_positive_int(dpi_var.get())
-            max_length = _parse_positive_int(max_length_var.get())
-            lang = _build_lang_string(eng_var.get(), ita_var.get(), deu_var.get(), extra_lang_var.get())
+            delay = _parse_positive_int(delay_edit.text())
+            dpi = _parse_positive_int(dpi_edit.text())
+            max_length = _parse_positive_int(max_length_edit.text())
+            lang = _build_lang_string(eng_check.isChecked(), ita_check.isChecked(),
+                                      deu_check.isChecked(), extra_lang_edit.text())
 
             if delay is None:
-                error_label.config(text="Il delay tra rilevamenti deve essere un numero intero positivo.")
+                error_label.setText("Il delay tra rilevamenti deve essere un numero intero positivo.")
                 return
             if dpi is None:
-                error_label.config(text="Il DPI deve essere un numero intero positivo.")
+                error_label.setText("Il DPI deve essere un numero intero positivo.")
                 return
             if max_length is None:
-                error_label.config(text="La lunghezza massima del nome deve essere un numero intero positivo.")
+                error_label.setText("La lunghezza massima del nome deve essere un numero intero positivo.")
                 return
             if not lang:
-                error_label.config(text="Seleziona almeno una lingua OCR.")
+                error_label.setText("Seleziona almeno una lingua OCR.")
                 return
 
             result['value'] = {
-                'folder': folder_var.get(),
-                'prefix': prefix_var.get() or "DOC",
+                'folder': folder_edit.text(),
+                'prefix': prefix_edit.text() or "DOC",
                 'delay_riavvio': str(delay),
                 'lang': lang,
                 'dpi': str(dpi),
                 'max_length': str(max_length),
-                'remove_leading_zeros': str(remove_zeros_var.get()),
+                'remove_leading_zeros': str(remove_zeros_check.isChecked()),
             }
-            root.destroy()
+            dialogo.accept()
 
-        def on_close():
-            result['value'] = None
-            root.destroy()
-
-        Button(root, text="Conferma", command=on_confirm).grid(row=row, column=0, columnspan=3, pady=8)
-        root.protocol("WM_DELETE_WINDOW", on_close)
-
-        root.mainloop()
+        conferma.clicked.connect(on_confirm)
+        # Closing the window (or Esc) rejects: result stays None.
+        dialogo.exec()
         return result['value']
     except Exception as e:
         print(f"⚠️ Errore nella finestra di configurazione: {e}. Uso i prompt da console.")

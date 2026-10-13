@@ -14,6 +14,7 @@ import ctypes  # For Windows console manipulation
 import atexit
 import threading
 import json
+import signal
 import configparser
 from xml.etree import ElementTree
 
@@ -24,24 +25,17 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from .config import load_or_create_config
-from . import __version__, aggiornamento
+from . import __version__, aggiornamento, gui
 
-# Entrambe le dipendenze sono opzionali e vanno degradate silenziosamente, non solo
-# quando mancano: importare pystray su una macchina senza display avvia la ricerca
-# del backend e solleva un errore Xlib, non un ImportError. Un guard troppo stretto
-# faceva quindi crashare l'intero programma invece di lasciarlo senza tray.
-try:
-    from tkinter import Tk, Canvas, Button, Label, Frame, Scrollbar, Listbox, messagebox
-    from PIL import ImageTk
-    TKINTER_AVAILABLE = True
-except Exception:
-    TKINTER_AVAILABLE = False
-
-try:
-    import pystray
-    PYSTRAY_AVAILABLE = True
-except Exception:
-    PYSTRAY_AVAILABLE = False
+# Qt is optional and imported through gui.py's broad guard: without it (or
+# without a display) the program runs headless — no tray, no calibrator.
+if gui.QT_AVAILABLE:
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QColor, QPainter, QPen
+    from PySide6.QtWidgets import (
+        QApplication, QDialog, QHBoxLayout, QLabel, QListWidget, QMenu, QPushButton,
+        QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget,
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -870,7 +864,7 @@ MAX_BOXES = 5
 
 # Guards the "open calibrator + save config" critical section so the tray's
 # recalibrate action and the per-file auto-calibration (on the watchdog
-# observer thread) can never both hold an open Tk mainloop or write
+# observer thread) can never both open a calibrator or write
 # config.ini at the same time.
 _calibration_lock = threading.Lock()
 
@@ -965,18 +959,100 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, ocr_cfg: dict,
     sull'immagine visualizzata al momento del salvataggio (non necessariamente quella di
     `initial_path`, se nel frattempo si è passati a un altro file dalla lista). Ritorna None se
     l'utente annulla.
+
+    Callable from any thread: the page is rendered here, the window itself runs
+    on the GUI thread through `gui.esegui_in_gui`.
     """
-    if not TKINTER_AVAILABLE:
-        print("⚠️ tkinter non disponibile: calibrazione box saltata.")
+    if not gui.disponibile():
+        print("⚠️ Interfaccia grafica non disponibile: calibrazione box saltata.")
+        return None
+    try:
+        # Rendering takes seconds on a network share: done on the calling
+        # thread so the GUI stays responsive while it happens.
+        img = _render_pdf_page(initial_path, ocr_cfg['dpi'])
+        return gui.esegui_in_gui(_finestra_calibrazione, pdf_paths, initial_path, img,
+                                 boxes, ocr_cfg, name_cfg)
+    except Exception as e:
+        print(f"⚠️ Errore durante la calibrazione dei box: {e}")
         return None
 
+
+if gui.QT_AVAILABLE:
+    class _PaginaCalibrazione(QWidget):
+        """The rendered page with the boxes on top; drag to redraw the active box.
+
+        Pure view: geometry lives in the calibrator's `state`, and mouse
+        results are handed back through `on_rilascio(x0, y0, x1, y1)` in
+        widget (= scaled image) coordinates.
+        """
+
+        def __init__(self, state: dict, on_rilascio, on_rotella):
+            super().__init__()
+            self.state = state
+            self.on_rilascio = on_rilascio
+            self.on_rotella = on_rotella
+            self.pixmap = None
+            self.scala = 1.0
+            self.inizio = None
+            self.corrente = None
+            self.setCursor(Qt.CrossCursor)
+
+        def imposta(self, pixmap, scala: float):
+            self.pixmap = pixmap
+            self.scala = scala
+            self.setFixedSize(pixmap.size())
+            self.update()
+
+        def paintEvent(self, event):
+            if self.pixmap is None:
+                return
+            p = QPainter(self)
+            p.drawPixmap(0, 0, self.pixmap)
+            dx, dy = self.state['preview_shift']
+            s = self.scala
+            for i, (x1, y1, x2, y2) in enumerate(self.state['boxes']):
+                p.setPen(QPen(QColor(BOX_COLORS[i]), 3))
+                p.drawRect(QRectF((x1 + dx) * s, (y1 + dy) * s, (x2 - x1) * s, (y2 - y1) * s))
+            if self.inizio is not None and self.corrente is not None:
+                penna = QPen(QColor(BOX_COLORS[self.state['active']]), 2, Qt.DashLine)
+                p.setPen(penna)
+                p.drawRect(QRectF(self.inizio, self.corrente).normalized())
+            p.end()
+
+        def mousePressEvent(self, event):
+            if event.button() == Qt.LeftButton:
+                self.inizio = event.position()
+                self.corrente = self.inizio
+
+        def mouseMoveEvent(self, event):
+            if self.inizio is not None:
+                self.corrente = event.position()
+                self.update()
+
+        def mouseReleaseEvent(self, event):
+            if event.button() != Qt.LeftButton or self.inizio is None:
+                return
+            a, b = self.inizio, event.position()
+            self.inizio = self.corrente = None
+            self.update()
+            self.on_rilascio(a.x(), a.y(), b.x(), b.y())
+
+        def wheelEvent(self, event):
+            # The wheel zooms, like the +/− buttons, instead of scrolling.
+            self.on_rotella(event.angleDelta().y())
+            event.accept()
+
+
+def _finestra_calibrazione(pdf_paths: list, initial_path: str, initial_img: "Image.Image",
+                           boxes: list, ocr_cfg: dict, name_cfg: dict):
+    """The calibrator window proper; GUI thread only. See `_calibra_box`."""
     dpi = ocr_cfg['dpi']
 
     MIN_DRAG = 4  # px — ignore accidental clicks/near-zero drags
     MAX_ZOOM = 6.0  # relative to the initial fit-to-screen view
     MAX_DIM = 8000  # px safety cap on the rendered (zoomed) image size
 
-    image_cache: dict = {}
+    image_cache: dict = {initial_path: initial_img}
 
     def get_image(path: str) -> "Image.Image":
         if path not in image_cache:
@@ -985,364 +1061,329 @@ def _calibra_box(pdf_paths: list, initial_path: str, boxes: list, ocr_cfg: dict,
 
     state = {
         'boxes': list(boxes),
-        'active': 0, 'start': None, 'drag_id': None, 'result': None,
-        'zoom': 1.0, 'photo': None, 'img': None, 'current_path': initial_path,
-        'reference_anchor': None, 'preview_shift': (0, 0),
+        'active': 0, 'result': None,
+        'zoom': 1.0, 'img': initial_img, 'current_path': initial_path,
+        'reference_anchor': _detect_content_anchor(initial_img), 'preview_shift': (0, 0),
+        'pixmap_full': gui.da_pil(initial_img),
     }
-    drawn_ids: dict = {}
-    select_buttons: dict = {}
+    # initial_path IS the reference for this session, so its own shift is always (0, 0);
+    # update_preview_shift() only needs to run again once a *different* file is selected.
 
     def update_preview_shift():
         current = _detect_content_anchor(state['img'])
         state['preview_shift'] = _compute_anchor_shift(current, state['reference_anchor'], dpi)
 
-    try:
-        state['img'] = get_image(initial_path)
-        state['reference_anchor'] = _detect_content_anchor(state['img'])
-        # initial_path IS the reference for this session, so its own shift is always (0, 0);
-        # update_preview_shift() only needs to run again once a *different* file is selected
-        # (see on_file_select below) — no need to call it here too.
-        root = Tk()
-        root.title("CMR Renamer - Calibrazione box OCR")
+    dialogo = QDialog()
+    dialogo.setWindowTitle("CMR Renamer - Calibrazione box OCR")
+    dialogo.setWindowFlag(Qt.WindowMaximizeButtonHint)
+    layout = QVBoxLayout(dialogo)
 
-        screen_w = max(root.winfo_screenwidth() - 150, 300)
-        screen_h = max(root.winfo_screenheight() - 260, 300)
-        base_scale = min(screen_w / state['img'].width, screen_h / state['img'].height, 1.0)
-        viewport_w = max(int(state['img'].width * base_scale), 1)
-        viewport_h = max(int(state['img'].height * base_scale), 1)
-        max_zoom = min(
-            MAX_ZOOM,
-            MAX_DIM / (state['img'].width * base_scale),
-            MAX_DIM / (state['img'].height * base_scale),
+    schermo = dialogo.screen().availableGeometry()
+    screen_w = max(schermo.width() - 380, 300)
+    screen_h = max(schermo.height() - 260, 300)
+    base_scale = min(screen_w / initial_img.width, screen_h / initial_img.height, 1.0)
+    max_zoom = min(
+        MAX_ZOOM,
+        MAX_DIM / (initial_img.width * base_scale),
+        MAX_DIM / (initial_img.height * base_scale),
+    )
+
+    # ── Top row: box selectors, box count, zoom ──
+    top = QHBoxLayout()
+    layout.addLayout(top)
+    select_row = QHBoxLayout()
+    top.addLayout(select_row)
+    top.addSpacing(20)
+    add_btn = QPushButton("+ Box")
+    remove_btn = QPushButton("− Box")
+    top.addWidget(add_btn)
+    top.addWidget(remove_btn)
+    top.addSpacing(20)
+    zoom_out_btn = QPushButton("−")
+    zoom_label = QLabel("100%")
+    zoom_label.setMinimumWidth(48)
+    zoom_label.setAlignment(Qt.AlignCenter)
+    zoom_in_btn = QPushButton("+")
+    zoom_reset_btn = QPushButton("Reset zoom")
+    for w in (zoom_out_btn, zoom_in_btn):
+        w.setFixedWidth(32)
+    for w in (zoom_out_btn, zoom_label, zoom_in_btn, zoom_reset_btn):
+        top.addWidget(w)
+    top.addStretch(1)
+
+    label = QLabel("")
+    layout.addWidget(label)
+
+    # ── Body: file list + page ──
+    body = QHBoxLayout()
+    layout.addLayout(body, 1)
+    sidebar = QVBoxLayout()
+    body.addLayout(sidebar)
+    sidebar.addWidget(QLabel("File nella cartella:"))
+    file_list = QListWidget()
+    file_list.setFixedWidth(260)
+    for path in pdf_paths:
+        file_list.addItem(os.path.basename(path))
+    sidebar.addWidget(file_list, 1)
+
+    def on_rilascio(x0, y0, x1, y1):
+        if abs(x1 - x0) < MIN_DRAG or abs(y1 - y0) < MIN_DRAG:
+            return  # too small to be an intentional box — ignore
+        scale = total_scale()
+        disp_w = max(int(state['img'].width * scale), 1)
+        disp_h = max(int(state['img'].height * scale), 1)
+        x0 = min(max(x0, 0), disp_w)
+        x1 = min(max(x1, 0), disp_w)
+        y0 = min(max(y0, 0), disp_h)
+        y1 = min(max(y1, 0), disp_h)
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        dx, dy = state['preview_shift']
+        state['boxes'][state['active']] = (
+            int(x0 / scale) - dx, int(y0 / scale) - dy,
+            int(x1 / scale) - dx, int(y1 / scale) - dy,
         )
+        pagina.update()
 
-        top_frame = Frame(root)
-        top_frame.pack(pady=4)
+    def on_rotella(delta):
+        if delta > 0:
+            zoom_in()
+        elif delta < 0:
+            zoom_out()
 
-        select_frame = Frame(top_frame)
-        select_frame.pack(side="left")
+    pagina = _PaginaCalibrazione(state, on_rilascio, on_rotella)
+    scroll = QScrollArea()
+    scroll.setWidget(pagina)
+    scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+    scroll.setStyleSheet("QScrollArea { background: #333333; }")
+    scroll.setMinimumSize(
+        min(int(initial_img.width * base_scale) + 4, screen_w),
+        min(int(initial_img.height * base_scale) + 4, screen_h),
+    )
+    body.addWidget(scroll, 1)
 
-        count_frame = Frame(top_frame)
-        count_frame.pack(side="left", padx=20)
+    # ── Bottom: OCR test result and buttons ──
+    prova_label = QLabel("")
+    prova_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    layout.addWidget(prova_label)
+    bottoni = QHBoxLayout()
+    layout.addLayout(bottoni)
+    bottoni.addStretch(1)
+    prova_btn = QPushButton("Prova OCR")
+    salva_btn = QPushButton("Salva")
+    annulla_btn = QPushButton("Annulla")
+    for w in (prova_btn, salva_btn, annulla_btn):
+        bottoni.addWidget(w)
+    bottoni.addStretch(1)
 
-        zoom_frame = Frame(top_frame)
-        zoom_frame.pack(side="left", padx=20)
+    select_buttons: dict = {}
 
-        label = Label(root, text="")
-        label.pack(pady=2)
+    def total_scale():
+        return base_scale * state['zoom']
 
-        body_frame = Frame(root)
-        body_frame.pack()
+    def render():
+        scale = total_scale()
+        disp_w = max(int(state['img'].width * scale), 1)
+        disp_h = max(int(state['img'].height * scale), 1)
+        pixmap = state['pixmap_full'].scaled(disp_w, disp_h, Qt.IgnoreAspectRatio,
+                                             Qt.SmoothTransformation)
+        pagina.imposta(pixmap, scale)
+        zoom_label.setText(f"{int(state['zoom'] * 100)}%")
 
-        sidebar_frame = Frame(body_frame)
-        sidebar_frame.pack(side="left", fill="y", padx=(4, 4))
-
-        Label(sidebar_frame, text="File nella cartella:").pack(anchor="w")
-        file_listbox = Listbox(sidebar_frame, width=32, height=28, exportselection=False)
-        file_scrollbar = Scrollbar(sidebar_frame, orient="vertical", command=file_listbox.yview)
-        file_listbox.configure(yscrollcommand=file_scrollbar.set)
-        file_listbox.pack(side="left", fill="y")
-        file_scrollbar.pack(side="left", fill="y")
-
-        for path in pdf_paths:
-            file_listbox.insert("end", os.path.basename(path))
-        if initial_path in pdf_paths:
-            initial_index = pdf_paths.index(initial_path)
-            file_listbox.selection_set(initial_index)
-            file_listbox.see(initial_index)
-
-        canvas_frame = Frame(body_frame)
-        canvas_frame.pack(side="left")
-
-        canvas = Canvas(canvas_frame, width=viewport_w, height=viewport_h, cursor="cross", bg="#333333")
-        vbar = Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
-        hbar = Scrollbar(root, orient="horizontal", command=canvas.xview)
-        canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
-        canvas.grid(row=0, column=0)
-        vbar.grid(row=0, column=1, sticky="ns")
-        hbar.pack(fill="x")
-
-        image_item = canvas.create_image(0, 0, anchor="nw")
-
-        def total_scale():
-            return base_scale * state['zoom']
-
-        def draw_box(index):
-            scale = total_scale()
-            dx, dy = state['preview_shift']
-            bx1, by1, bx2, by2 = state['boxes'][index]
-            x1, y1, x2, y2 = [(bx1 + dx) * scale, (by1 + dy) * scale, (bx2 + dx) * scale, (by2 + dy) * scale]
-            if index in drawn_ids:
-                canvas.delete(drawn_ids[index])
-            drawn_ids[index] = canvas.create_rectangle(
-                x1, y1, x2, y2, outline=BOX_COLORS[index], width=3
-            )
-
-        def draw_all_boxes():
-            for old_id in drawn_ids.values():
-                canvas.delete(old_id)
-            drawn_ids.clear()
-            for i in range(len(state['boxes'])):
-                draw_box(i)
-
-        def render():
-            scale = total_scale()
-            disp_w = max(int(state['img'].width * scale), 1)
-            disp_h = max(int(state['img'].height * scale), 1)
-            state['photo'] = ImageTk.PhotoImage(state['img'].resize((disp_w, disp_h)))
-            canvas.itemconfig(image_item, image=state['photo'])
-            canvas.configure(scrollregion=(0, 0, disp_w, disp_h))
-            draw_all_boxes()
-            zoom_label.config(text=f"{int(state['zoom'] * 100)}%")
-
-        def set_zoom(new_zoom):
-            new_zoom = max(1.0, min(new_zoom, max_zoom))
-            if new_zoom == state['zoom']:
-                return
-            state['zoom'] = new_zoom
-            render()
-
-        def zoom_in():
-            set_zoom(state['zoom'] * 1.25)
-
-        def zoom_out():
-            set_zoom(state['zoom'] / 1.25)
-
-        def zoom_reset():
-            set_zoom(1.0)
-
-        def on_mousewheel(event):
-            # Windows/Mac deliver <MouseWheel> with event.delta; Linux uses
-            # separate Button-4/Button-5 events instead (handled below).
-            if event.delta > 0:
-                zoom_in()
-            else:
-                zoom_out()
-
-        canvas.bind("<MouseWheel>", on_mousewheel)
-        canvas.bind("<Button-4>", lambda e: zoom_in())
-        canvas.bind("<Button-5>", lambda e: zoom_out())
-
-        Button(zoom_frame, text="−", command=zoom_out, width=3).pack(side="left")
-        zoom_label = Label(zoom_frame, text="100%", width=6)
-        zoom_label.pack(side="left", padx=4)
-        Button(zoom_frame, text="+", command=zoom_in, width=3).pack(side="left")
-        Button(zoom_frame, text="Reset zoom", command=zoom_reset).pack(side="left", padx=8)
-
-        def set_active(index):
-            state['active'] = index
-            for i, btn in select_buttons.items():
-                btn.config(relief=("sunken" if i == index else "raised"))
-            label.config(text=f"Box attivo: {_box_label(index)}. Trascina col mouse per ridisegnarlo (rotellina per zoomare).")
-
-        def update_count_buttons():
-            add_btn.config(state=("disabled" if len(state['boxes']) >= MAX_BOXES else "normal"))
-            remove_btn.config(state=("disabled" if len(state['boxes']) <= MIN_BOXES else "normal"))
-
-        def rebuild_select_buttons():
-            for btn in select_buttons.values():
-                btn.destroy()
-            select_buttons.clear()
-            for i in range(len(state['boxes'])):
-                btn = Button(
-                    select_frame, text=_box_label(i), command=lambda n=i: set_active(n),
-                    bg=BOX_COLORS[i], fg="white", activebackground=BOX_COLORS[i], activeforeground="white",
-                )
-                btn.pack(side="left", padx=5)
-                select_buttons[i] = btn
-            update_count_buttons()
-
-        def add_box():
-            if len(state['boxes']) >= MAX_BOXES:
-                return
-            state['boxes'].append(_default_box(len(state['boxes'])))
-            rebuild_select_buttons()
-            set_active(len(state['boxes']) - 1)
-            render()
-
-        def remove_box():
-            if len(state['boxes']) <= MIN_BOXES:
-                return
-            removed = state['active']
-            del state['boxes'][removed]
-            rebuild_select_buttons()
-            set_active(max(removed - 1, 0))
-            render()
-
-        add_btn = Button(count_frame, text="+ Box", command=add_box)
-        add_btn.pack(side="left", padx=2)
-        remove_btn = Button(count_frame, text="− Box", command=remove_box)
-        remove_btn.pack(side="left", padx=2)
-
-        def on_file_select(event=None):
-            selection = file_listbox.curselection()
-            if not selection:
-                return
-            path = pdf_paths[selection[0]]
-            if path == state['current_path']:
-                return
-            try:
-                new_img = get_image(path)
-            except Exception as e:
-                print(f"⚠️ Impossibile aprire '{os.path.basename(path)}': {e}")
-                file_listbox.selection_clear(0, "end")
-                file_listbox.selection_set(pdf_paths.index(state['current_path']))
-                return
-            state['img'] = new_img
-            state['current_path'] = path
-            update_preview_shift()
-            render()
-
-        file_listbox.bind("<<ListboxSelect>>", on_file_select)
-
-        rebuild_select_buttons()
-        set_active(0)
+    def set_zoom(new_zoom):
+        new_zoom = max(1.0, min(new_zoom, max_zoom))
+        if new_zoom == state['zoom']:
+            return
+        state['zoom'] = new_zoom
         render()
 
-        def on_press(event):
-            state['start'] = (canvas.canvasx(event.x), canvas.canvasy(event.y))
+    def zoom_in():
+        set_zoom(state['zoom'] * 1.25)
 
-        def on_drag(event):
-            if state['start'] is None:
-                return
-            if state['drag_id'] is not None:
-                canvas.delete(state['drag_id'])
-            x0, y0 = state['start']
-            cx, cy = canvas.canvasx(event.x), canvas.canvasy(event.y)
-            state['drag_id'] = canvas.create_rectangle(
-                x0, y0, cx, cy, outline=BOX_COLORS[state['active']], width=2, dash=(4, 2)
+    def zoom_out():
+        set_zoom(state['zoom'] / 1.25)
+
+    zoom_out_btn.clicked.connect(zoom_out)
+    zoom_in_btn.clicked.connect(zoom_in)
+    zoom_reset_btn.clicked.connect(lambda: set_zoom(1.0))
+
+    def set_active(index):
+        state['active'] = index
+        for i, btn in select_buttons.items():
+            btn.setChecked(i == index)
+        label.setText(f"Box attivo: {_box_label(index)}. Trascina col mouse per ridisegnarlo "
+                      f"(rotellina per zoomare).")
+
+    def update_count_buttons():
+        add_btn.setEnabled(len(state['boxes']) < MAX_BOXES)
+        remove_btn.setEnabled(len(state['boxes']) > MIN_BOXES)
+
+    def rebuild_select_buttons():
+        for btn in select_buttons.values():
+            select_row.removeWidget(btn)
+            # deleteLater() acts on the next loop iteration: until then an
+            # unmanaged, still-visible button would float over the window.
+            btn.hide()
+            btn.deleteLater()
+        select_buttons.clear()
+        for i in range(len(state['boxes'])):
+            btn = QPushButton(_box_label(i))
+            btn.setCheckable(True)
+            # The checked one gets a thick border: the color says which
+            # rectangle it is, the border which one the next drag redraws.
+            btn.setStyleSheet(
+                f"QPushButton {{ background: {BOX_COLORS[i]}; color: white; padding: 4px 8px;"
+                f" border: 2px solid {BOX_COLORS[i]}; }}"
+                f"QPushButton:checked {{ border: 3px solid black; font-weight: bold; }}"
             )
+            btn.clicked.connect(lambda _=False, n=i: set_active(n))
+            select_row.addWidget(btn)
+            select_buttons[i] = btn
+        update_count_buttons()
 
-        def on_release(event):
-            if state['drag_id'] is not None:
-                canvas.delete(state['drag_id'])
-                state['drag_id'] = None
-            if state['start'] is None:
-                return
-            x0, y0 = state['start']
-            state['start'] = None
-            x1, y1 = canvas.canvasx(event.x), canvas.canvasy(event.y)
+    def add_box():
+        if len(state['boxes']) >= MAX_BOXES:
+            return
+        state['boxes'].append(_default_box(len(state['boxes'])))
+        rebuild_select_buttons()
+        set_active(len(state['boxes']) - 1)
+        pagina.update()
 
-            if abs(x1 - x0) < MIN_DRAG or abs(y1 - y0) < MIN_DRAG:
-                return  # too small to be an intentional box — ignore
+    def remove_box():
+        if len(state['boxes']) <= MIN_BOXES:
+            return
+        removed = state['active']
+        del state['boxes'][removed]
+        rebuild_select_buttons()
+        set_active(max(removed - 1, 0))
+        pagina.update()
 
-            scale = total_scale()
-            disp_w = max(int(state['img'].width * scale), 1)
-            disp_h = max(int(state['img'].height * scale), 1)
-            x0 = min(max(x0, 0), disp_w)
-            x1 = min(max(x1, 0), disp_w)
-            y0 = min(max(y0, 0), disp_h)
-            y1 = min(max(y1, 0), disp_h)
-            x0, x1 = sorted((x0, x1))
-            y0, y1 = sorted((y0, y1))
+    add_btn.clicked.connect(add_box)
+    remove_btn.clicked.connect(remove_box)
 
-            dx, dy = state['preview_shift']
-            index = state['active']
-            state['boxes'][index] = (
-                int(x0 / scale) - dx, int(y0 / scale) - dy,
-                int(x1 / scale) - dx, int(y1 / scale) - dy,
-            )
-            draw_box(index)
+    def on_file_select(row):
+        if row < 0:
+            return
+        path = pdf_paths[row]
+        if path == state['current_path']:
+            return
+        try:
+            new_img = get_image(path)
+        except Exception as e:
+            print(f"⚠️ Impossibile aprire '{os.path.basename(path)}': {e}")
+            file_list.blockSignals(True)
+            file_list.setCurrentRow(pdf_paths.index(state['current_path']))
+            file_list.blockSignals(False)
+            return
+        state['img'] = new_img
+        state['pixmap_full'] = gui.da_pil(new_img)
+        state['current_path'] = path
+        update_preview_shift()
+        render()
 
-        canvas.bind("<ButtonPress-1>", on_press)
-        canvas.bind("<B1-Motion>", on_drag)
-        canvas.bind("<ButtonRelease-1>", on_release)
+    if initial_path in pdf_paths:
+        file_list.setCurrentRow(pdf_paths.index(initial_path))
+    file_list.currentRowChanged.connect(on_file_select)
 
-        btn_frame = Frame(root)
-        btn_frame.pack(pady=8)
+    def on_save():
+        state['result'] = {
+            'boxes': list(state['boxes']),
+            'anchor': _detect_content_anchor(state['img']),
+        }
+        dialogo.accept()
 
-        def on_save():
-            state['result'] = {
-                'boxes': list(state['boxes']),
-                'anchor': _detect_content_anchor(state['img']),
-            }
-            root.destroy()
+    def on_prova():
+        """Esegue l'OCR sui box correnti e mostra cosa produrrebbero.
 
-        def on_cancel():
-            state['result'] = None
-            root.destroy()
+        Usa lo stesso `preview_shift` applicato al disegno, così misura
+        esattamente i ritagli che il programma userebbe su questo file, e la
+        stessa catena `_ocr_box` → `_pulisci_nome` → join di `_rinomina_pdf`.
+        """
+        prova_label.setStyleSheet("color: #444444;")
+        prova_label.setText("Prova in corso...")
+        # L'OCR è sincrono e blocca la finestra: si forza il ridisegno prima.
+        QApplication.processEvents()
+        dx, dy = state['preview_shift']
+        righe, parti = [], []
+        try:
+            for i, (x1, y1, x2, y2) in enumerate(state['boxes'], start=1):
+                crop = _preprocess_for_ocr(
+                    state['img'].crop((x1 + dx, y1 + dy, x2 + dx, y2 + dy))
+                )
+                letto = _ocr_box(crop, ocr_cfg)
+                pulito = _pulisci_nome(
+                    letto['testo'], name_cfg['max_length'], name_cfg['remove_leading_zeros'],
+                )
+                if pulito:
+                    parti.append(pulito)
+                conf = letto['confidenza_min']
+                conf_txt = "n/d" if conf is None else f"{conf:.0f}"
+                righe.append(f"Box {i}: '{pulito}'   (confidenza {conf_txt})")
+        except Exception as e:
+            prova_label.setStyleSheet("color: #880000;")
+            prova_label.setText(f"Prova non riuscita: {e}")
+            return
+        nome = " ".join(parti).strip() or "documento_senza_nome"
+        righe.append(f"→ nome file: '{nome}.pdf'")
+        prova_label.setStyleSheet("color: #004400;")
+        prova_label.setText("\n".join(righe))
 
-        prova_label = Label(root, text="", justify="left", anchor="w", fg="#004400")
-        prova_label.pack(fill="x", padx=8, pady=(0, 6))
+    prova_btn.clicked.connect(on_prova)
+    salva_btn.clicked.connect(on_save)
+    annulla_btn.clicked.connect(dialogo.reject)
 
-        def on_prova():
-            """Esegue l'OCR sui box correnti e mostra cosa produrrebbero.
+    rebuild_select_buttons()
+    set_active(0)
+    render()
 
-            Usa lo stesso `preview_shift` applicato al disegno, così misura
-            esattamente i ritagli che il programma userebbe su questo file, e la
-            stessa catena `_ocr_box` → `_pulisci_nome` → join di `_rinomina_pdf`.
-            """
-            prova_label.config(text="Prova in corso...", fg="#444444")
-            # L'OCR è sincrono e blocca la finestra: si forza il ridisegno prima.
-            root.update_idletasks()
-            dx, dy = state['preview_shift']
-            righe, parti = [], []
-            try:
-                for i, (x1, y1, x2, y2) in enumerate(state['boxes'], start=1):
-                    crop = _preprocess_for_ocr(
-                        state['img'].crop((x1 + dx, y1 + dy, x2 + dx, y2 + dy))
-                    )
-                    letto = _ocr_box(crop, ocr_cfg)
-                    pulito = _pulisci_nome(
-                        letto['testo'], name_cfg['max_length'], name_cfg['remove_leading_zeros'],
-                    )
-                    if pulito:
-                        parti.append(pulito)
-                    conf = letto['confidenza_min']
-                    conf_txt = "n/d" if conf is None else f"{conf:.0f}"
-                    righe.append(f"Box {i}: '{pulito}'   (confidenza {conf_txt})")
-            except Exception as e:
-                prova_label.config(text=f"Prova non riuscita: {e}", fg="#880000")
-                return
-            nome = " ".join(parti).strip() or "documento_senza_nome"
-            righe.append(f"→ nome file: '{nome}.pdf'")
-            prova_label.config(text="\n".join(righe), fg="#004400")
-
-        Button(btn_frame, text="Prova OCR", command=on_prova).pack(side="left", padx=5)
-        Button(btn_frame, text="Salva", command=on_save).pack(side="left", padx=5)
-        Button(btn_frame, text="Annulla", command=on_cancel).pack(side="left", padx=5)
-
-        root.mainloop()
-        return state['result']
-    except Exception as e:
-        print(f"⚠️ Errore durante la calibrazione dei box: {e}")
-        return None
+    # Opened from the tray or a background thread: make sure it is not left
+    # behind other windows.
+    dialogo.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+    dialogo.show()
+    dialogo.raise_()
+    dialogo.activateWindow()
+    dialogo.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+    dialogo.show()
+    dialogo.exec()
+    return state['result']
 
 
 def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, name_cfg: dict, log_path: str,
                       cartella: str, stop_event: "threading.Event",
-                      aggiornatore: "aggiornamento.Aggiornatore | None" = None) -> "pystray.Icon":
-    """Crea l'icona di system tray con il menu di controllo del background mode."""
+                      aggiornatore: "aggiornamento.Aggiornatore | None" = None) -> "QSystemTrayIcon":
+    """Crea l'icona di system tray con il menu di controllo del background mode.
 
-    def _controlla_aggiornamenti(icon, item):
-        # Rete e download possono durare decine di secondi: fuori dal thread del
-        # tray, che altrimenti resterebbe bloccato con il menu.
+    GUI thread only. The actions run there too, so anything slow (network,
+    renames on the share) is moved to a thread; message boxes go back through
+    `gui`, which works from any thread.
+    """
+
+    def _controlla_aggiornamenti():
+        # Rete e download possono durare decine di secondi: fuori dal thread
+        # della GUI, che altrimenti resterebbe bloccato.
         def controlla():
             esito = aggiornatore.controlla()
-            if TKINTER_AVAILABLE and "riavvio in corso" not in esito:
+            if "riavvio in corso" not in esito:
                 try:
-                    radice = Tk()
-                    radice.withdraw()
-                    messagebox.showinfo("CMR Renamer", esito)
-                    radice.destroy()
+                    gui.mostra_info("CMR Renamer", esito)
                 except Exception as e:
                     print(f"⚠️ Impossibile mostrare l'esito ({e}).")
 
         threading.Thread(target=controlla, daemon=True).start()
 
-    def _open_log(icon, item):
+    def _open_log():
         try:
             os.startfile(os.path.normpath(log_path))
         except Exception as e:
             print(f"⚠️ Impossibile aprire il log: {e}")
 
-    def _open_folder(icon, item):
+    def _open_folder():
         try:
             os.startfile(os.path.normpath(cartella))
         except Exception as e:
             print(f"⚠️ Impossibile aprire la cartella: {e}")
 
-    def _recalibra(icon, item):
+    def _recalibra():
         if not _calibration_lock.acquire(blocking=False):
             print("⚠️ Calibrazione già in corso altrove: riprova più tardi.")
             return
@@ -1365,47 +1406,56 @@ def _build_tray_icon(icon_image: "Image.Image", ocr_cfg: dict, name_cfg: dict, l
         finally:
             _calibration_lock.release()
 
-    def _annulla(icon, item):
+    def _annulla():
         voci = _rinomine_annullabili()
         if not voci:
             print("⚠️ Nessuna rinomina da annullare in questa sessione.")
             return
         # Tocca file su una condivisione di rete e una voce di menu è troppo
         # facile da centrare per sbaglio: si chiede conferma quando è possibile.
-        if TKINTER_AVAILABLE:
-            try:
-                radice = Tk()
-                radice.withdraw()
-                conferma = messagebox.askyesno(
-                    "CMR Renamer",
-                    f"Ripristinare i nomi originali di {len(voci)} file rinominati "
-                    f"in questa sessione?",
-                )
-                radice.destroy()
-                if not conferma:
-                    print("↩️ Annullamento non confermato: nessuna modifica.")
-                    return
-            except Exception as e:
-                print(f"⚠️ Impossibile mostrare la conferma ({e}): procedo comunque.")
-        ripristinati, saltati = _annulla_rinomine()
-        print(f"↩️ Annullamento completato: {ripristinati} ripristinati, {saltati} saltati.")
+        try:
+            conferma = gui.chiedi_conferma(
+                "CMR Renamer",
+                f"Ripristinare i nomi originali di {len(voci)} file rinominati "
+                f"in questa sessione?",
+            )
+        except Exception as e:
+            print(f"⚠️ Impossibile mostrare la conferma ({e}): procedo comunque.")
+            conferma = None
+        if conferma is False:
+            print("↩️ Annullamento non confermato: nessuna modifica.")
+            return
 
-    def _exit(icon, item):
-        icon.stop()
+        def annulla():
+            ripristinati, saltati = _annulla_rinomine()
+            print(f"↩️ Annullamento completato: {ripristinati} ripristinati, {saltati} saltati.")
+
+        threading.Thread(target=annulla, daemon=True).start()
+
+    def _exit():
+        # The event loop notices within 200 ms (gui.ciclo_eventi) and run()
+        # shuts the observer down in order.
         stop_event.set()
 
-    voci = [
-        pystray.MenuItem(f"CMR Renamer {__version__}", None, enabled=False),
-        pystray.MenuItem("Apri log", _open_log),
-        pystray.MenuItem("Apri cartella monitorata", _open_folder),
-        pystray.MenuItem("Ricalibra box", _recalibra),
-        pystray.MenuItem("Annulla ultime rinomine", _annulla),
-    ]
+    tray = QSystemTrayIcon(gui.icona(icon_image))
+    tray.setToolTip("CMR Renamer")
+    menu = QMenu()
+    versione = menu.addAction(f"CMR Renamer {__version__}")
+    versione.setEnabled(False)
+    menu.addSeparator()
+    menu.addAction("Apri log").triggered.connect(_open_log)
+    menu.addAction("Apri cartella monitorata").triggered.connect(_open_folder)
+    menu.addAction("Ricalibra box").triggered.connect(_recalibra)
+    menu.addAction("Annulla ultime rinomine").triggered.connect(_annulla)
     if aggiornatore is not None:
-        voci.append(pystray.MenuItem("Controlla aggiornamenti", _controlla_aggiornamenti))
-    voci.append(pystray.MenuItem("Esci", _exit))
-    menu = pystray.Menu(*voci)
-    return pystray.Icon("cmr-renamer", icon_image, "CMR Renamer", menu)
+        menu.addAction("Controlla aggiornamenti").triggered.connect(_controlla_aggiornamenti)
+    menu.addSeparator()
+    menu.addAction("Esci").triggered.connect(_exit)
+    tray.setContextMenu(menu)
+    # setContextMenu does not take ownership: without this reference Python
+    # would collect the menu and right-clicking the icon would show nothing.
+    tray._menu = menu
+    return tray
 
 
 MAX_ANCHOR_SHIFT_MM = 15  # oltre questa soglia lo spostamento rilevato è considerato inaffidabile
@@ -1615,8 +1665,8 @@ def run() -> int:
     config_exists = os.path.exists(config_path)
 
     # ── Background vs interactive mode ─────────────────────
-    if _is_frozen() and not config_exists and not TKINTER_AVAILABLE:
-        # Frozen + no config + no tkinter → allocate a console so the text
+    if _is_frozen() and not config_exists and not gui.puo_avviarsi():
+        # Frozen + no config + no Qt → allocate a console so the text
         # prompts are visible, since there's no GUI form to fall back to.
         _alloc_console()
         print("\n=== CMR Renamer - Configurazione Iniziale ===\n")
@@ -1632,7 +1682,7 @@ def run() -> int:
             # After setup, continue in background mode
             _setup_file_logging(config_dir)
     elif _is_frozen() and not config_exists:
-        # Frozen + no config + tkinter available → the GUI form needs no console.
+        # Frozen + no config + Qt available → the GUI form needs no console.
         # File logging must be set up BEFORE load_or_create_config runs: a
         # --windowed build with no console allocated has sys.stdout/stderr set to
         # None, and load_or_create_config prints status messages — those would
@@ -1703,38 +1753,50 @@ def run() -> int:
     if _is_frozen():
         aggiornamento.pulisci_residui(sys.executable)
 
-    # ----------------------------------------------------------
-    # Process existing files on startup
-    # ----------------------------------------------------------
-    print(f"\n🔍 Elaborazione file esistenti in: {cartella}")
-    if os.path.isdir(cartella):
-        for fname in os.listdir(cartella):
-            if fname.startswith(prefix) and fname.endswith('.pdf'):
-                _rinomina_pdf(os.path.join(cartella, fname), ocr_cfg, name_cfg)
-    else:
-        print(f"⚠️ La cartella '{cartella}' non esiste. Il watcher attenderà che venga creata.")
+    # Qt widgets live on the main thread, so from here on it runs the event
+    # loop and the actual work (startup sweep, observer) happens on a worker
+    # thread. Created now, after the config form and file logging are set up.
+    app = gui.applicazione()
 
-    # ----------------------------------------------------------
-    # Start watcher
-    # ----------------------------------------------------------
-    print(f"\n👀 Monitoraggio avviato su: {cartella}")
-    print("   Premi Ctrl+C per fermare.\n")
+    stop_event = threading.Event()
+    riavvio = {'tag': None}
+    esito = {'codice': 0}
 
     handler = CMRHandler(ocr_cfg, name_cfg, delay_riavvio, prefix)
     observer = Observer()
-    try:
-        observer.schedule(handler, cartella, recursive=False)
-        observer.start()
-    except FileNotFoundError:
-        print(f"❌ Errore: La cartella monitorata '{cartella}' non è valida.")
-        return 1 # Indicate error
-    except Exception as e:
-        print(f"❌ Errore durante l'avvio del watcher: {e}")
-        return 1 # Indicate error
 
-    tray_icon = None
-    stop_event = threading.Event()
-    riavvio = {'tag': None}
+    def monitora():
+        # ----------------------------------------------------------
+        # Process existing files on startup
+        # ----------------------------------------------------------
+        print(f"\n🔍 Elaborazione file esistenti in: {cartella}")
+        if os.path.isdir(cartella):
+            for fname in os.listdir(cartella):
+                if stop_event.is_set():
+                    return
+                if fname.startswith(prefix) and fname.endswith('.pdf'):
+                    _rinomina_pdf(os.path.join(cartella, fname), ocr_cfg, name_cfg)
+        else:
+            print(f"⚠️ La cartella '{cartella}' non esiste. Il watcher attenderà che venga creata.")
+
+        # ----------------------------------------------------------
+        # Start watcher
+        # ----------------------------------------------------------
+        if stop_event.is_set():
+            return
+        print(f"\n👀 Monitoraggio avviato su: {cartella}")
+        print("   Premi Ctrl+C per fermare.\n")
+        try:
+            observer.schedule(handler, cartella, recursive=False)
+            observer.start()
+        except FileNotFoundError:
+            print(f"❌ Errore: La cartella monitorata '{cartella}' non è valida.")
+            esito['codice'] = 1
+            stop_event.set()
+        except Exception as e:
+            print(f"❌ Errore durante l'avvio del watcher: {e}")
+            esito['codice'] = 1
+            stop_event.set()
 
     aggiornatore = None
     if not _is_frozen():
@@ -1748,34 +1810,57 @@ def run() -> int:
             # Il nuovo exe è già al suo posto: si ferma tutto in modo ordinato
             # (observer.join aspetta il file in elaborazione) e lo si avvia alla fine.
             riavvio['tag'] = tag
-            if tray_icon is not None:
-                tray_icon.stop()
             stop_event.set()
 
         aggiornatore = aggiornamento.Aggiornatore(token_aggiornamenti, sys.executable, al_riavvio)
         aggiornatore.avvia_periodico(stop_event)
 
-    if _is_frozen() and PYSTRAY_AVAILABLE:
+    tray_icon = None
+    if app is not None and _is_frozen():
         try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                raise RuntimeError("area di notifica assente")
             icon_image = Image.open(_get_resource_path(os.path.join('assets', 'icon.ico')))
             log_path = os.path.join(config_dir, 'cmr-renamer.log')
             tray_icon = _build_tray_icon(icon_image, ocr_cfg, name_cfg, log_path, cartella, stop_event,
                                          aggiornatore)
-            threading.Thread(target=tray_icon.run, daemon=True).start()
+            tray_icon.show()
         except Exception as e:
             print(f"⚠️ Icona di system tray non disponibile: {e}")
             tray_icon = None
 
-    try:
-        # wait() a intervalli, non senza timeout: così Ctrl+C resta reattivo
-        # anche da console, e il riavvio per aggiornamento funziona senza tray.
-        while not stop_event.wait(1):
-            pass
-    except KeyboardInterrupt:
-        print("\n🛑 Arresto...")
+    lavoro = threading.Thread(target=monitora, name="monitoraggio", daemon=True)
+    lavoro.start()
 
-    observer.stop()
-    observer.join()
+    if app is not None:
+        # Python runs its SIGINT handler only between bytecodes, which the
+        # loop's polling timer provides; the default handler would raise
+        # KeyboardInterrupt inside a Qt slot instead of stopping cleanly.
+        def al_ctrl_c(*_):
+            print("\n🛑 Arresto...")
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, al_ctrl_c)
+        gui.ciclo_eventi(stop_event)
+    else:
+        try:
+            # wait() a intervalli, non senza timeout: così Ctrl+C resta reattivo
+            # anche da console, e il riavvio per aggiornamento funziona senza tray.
+            while not stop_event.wait(1):
+                pass
+        except KeyboardInterrupt:
+            print("\n🛑 Arresto...")
+    stop_event.set()
+
+    if tray_icon is not None:
+        tray_icon.hide()
+    # The sweep checks stop_event between files and a pending calibration
+    # returns None once the loop is over (gui.esegui_in_gui), so this ends
+    # after at most the file being processed.
+    lavoro.join()
+    if observer.is_alive():
+        observer.stop()
+        observer.join()
     if riavvio['tag']:
         print(f"🔄 Riavvio sulla {riavvio['tag']}...")
         try:
@@ -1783,4 +1868,4 @@ def run() -> int:
         except Exception as e:
             print(f"❌ Riavvio non riuscito ({e}): avvia di nuovo CMR Renamer a mano.")
     print("👋 Monitoraggio terminato.")
-    return 0
+    return esito['codice']

@@ -7,7 +7,7 @@ si verificano impronta e firma; poi si rinomina l'exe in esecuzione in `.old`
 (Windows lo permette) e il `.new` al suo posto, e si riavvia. Il `.old` si
 cancella al giro successivo, quando nessuno lo tiene più aperto.
 
-Il modulo non sa nulla di Tk, del tray o del watcher: `watcher.run()` gli passa
+Il modulo non sa nulla della GUI, del tray o del watcher: `watcher.run()` gli passa
 token, percorso dell'exe e una funzione da chiamare quando serve riavviare.
 """
 

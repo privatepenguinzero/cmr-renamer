@@ -69,11 +69,12 @@ jobs:
         shell: pwsh
 
       # 6️⃣ Build executable
-      #     --windowed = no console by default (background mode)
-      #     if config.ini is missing, the app allocates a console for setup
+      #     The spec is --onefile --windowed (no console by default; if config.ini is
+      #     missing and Qt cannot start, the app allocates a console for setup) and
+      #     drops the Qt files the program never loads.
       - name: Build executable
         run: |
-          uv run -- pyinstaller --onefile --windowed --name cmr-renamer --icon=assets/icon.ico --add-data "assets/icon.ico;assets" --add-data "vendor/poppler;vendor/poppler" --add-data "vendor/tesseract;vendor/tesseract" main.py
+          uv run -- pyinstaller cmr-renamer.spec
         shell: pwsh
 
       # 8️⃣ Verify executable exists
