@@ -61,6 +61,9 @@ DLL_DI_SISTEMA = {
 }
 
 
+RUNTIME_VC = {"msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "vcruntime140.dll", "vcruntime140_1.dll"}
+
+
 def _scarica(arg, cartella):
     """Percorso locale dell'exe: `arg` se è un file, altrimenti lo scarica dalla release `arg`."""
     if os.path.isfile(arg):
@@ -132,7 +135,10 @@ def main(argv):
             problemi += 1
             print(f"❌ manca {p}")
     vendor = {os.path.basename(p).lower() for p in percorsi if p.startswith("vendor/")}
-    doppie = sorted(p for p in percorsi if "/" not in p and p.lower() in vendor)
+    # Il runtime di Visual C++ sta legittimamente in entrambi i posti: nella radice per Python,
+    # in vendor/poppler/bin per Poppler (vedi cmr-renamer.spec).
+    doppie = sorted(p for p in percorsi
+                    if "/" not in p and p.lower() in vendor and p.lower() not in RUNTIME_VC)
     if doppie:
         problemi += 1
         print(f"❌ {len(doppie)} copie di vendor/ nella radice (filtro di cmr-renamer.spec): {', '.join(doppie[:5])}...")
