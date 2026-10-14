@@ -91,7 +91,7 @@ jobs:
 
       # 9️⃣ Upload artifact
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: cmr-renamer-windows-exe
           path: dist\cmr-renamer.exe
